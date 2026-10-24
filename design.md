@@ -887,7 +887,27 @@ V16 是第一版目标验收线，不是对所有麦克风、口音和环境的�
 - Claude 在未信任的目录启动时，会先弹出目录信任确认，跳过权限的参数不会跳过它。
 - Codex 遇到未信任的 Hook 时，启动后先显示 Hook 审核界面，Herdr 却报告 idle。本机已有的 Herdr Codex SessionStart Hook 尚未被信任，所以现有 Codex pane 没有 `agent_session`。
 
-里程碑 A 实现后，用 Claude 作为主 agent 和工作 agent 跑过以下验收场景，均通过：V01、V02、V03、V04、V05、V10、V14、V19（仅 daemon 重启后沿用主 agent、不重发）、V21、V24、V26（控制台 resolve 路径）、V28、V29（Claude 目录未信任）。Codex 路径尚未在 daemon 中端到端运行。
+里程碑 A、B 实现后，用 Claude 作为主 agent 和工作 agent 跑过以下验收场景，均通过：
+
+- 里程碑 A：V01、V02、V03、V04、V05、V10、V14、V19（仅 daemon 重启后沿用主 agent、不重发）、V21、V24、V26（控制台 resolve 路径）、V28、V29（Claude 目录未信任）。
+- 里程碑 B：
+  - V06；
+  - V09：daemon 停止期间 Hook 照常交接，重复的 spool 文件只处理一次；
+  - V11：注入提前的 Stop 候选，回合仍在运行时不结束，以最终的 Stop 为准；
+  - V13：注入"已 prepared、未写入"的崩溃状态，重启后标为投递不明，由用户 resubmit；
+  - V17、V18（`/clear` 更换原生会话后暂停，拒绝恢复）、V27；
+  - journal 尾部截断恢复；
+  - 主 agent 丢失时 daemon 拒绝启动，需 `--new-main`。
+
+Codex 路径尚未在 daemon 中端到端运行。
+
+实现中补充的规则：
+- Stop 之后需持续就绪 1.5 秒才算回合结束；
+- 主助手没有对结果调用 tasks.decide 时提示"结果尚未归类"；
+- 主 agent 出现 StopFailure 时暂停自动派发；
+- 用户在控制台取消或 resolve 任务后，向主助手投递状态通知，避免它继续处理已撤回的问题。
+
+已知后续项：journal 每条记录写入完整对象，长期运行会持续增长，尚未实现第 12.3 节的 state.json 快照与压缩。
 
 开始实现时仍需核验：
 
