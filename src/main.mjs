@@ -31,6 +31,7 @@ const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
 const POLL_MS = 1000;
 const DELIVERY_GRACE_MS = 15000; // 写入后迟迟没有 UserPromptSubmit
 const STOP_GRACE_MS = 8000; // 回合已就绪但没有可关联的 Stop
+const STOP_SETTLE_MS = 1500; // Stop 之后需持续就绪这么久才算回合结束，防止 Stop 后回合继续
 const CANCEL_TIMEOUT_MS = 30000;
 const SESSION_START_TIMEOUT_MS = 20000;
 
@@ -121,7 +122,7 @@ function loadJournal() {
       if (isTail) {
         const fragment = path.join(STATE_DIR, `journal.fragment-${Date.now()}`);
         writeFileAtomic(fragment, line);
-        truncateSync(JOURNAL_PATH, Buffer.byteLength(raw.slice(0, offset)));
+        truncateSync(JOURNAL_PATH, offset); // offset 按字节累计
         notice = `journal 尾部有不完整记录，已保存到 ${fragment} 并截断`;
         break;
       }
@@ -331,6 +332,12 @@ async function launchAgent(role, kind, cwd, displayName) {
       await sleep(200);
     }
   }
+  const obs = await herdr.inspect(agent.backendRef, kind);
+  if (obs.reachable && obs.present) {
+    agent.activity = obs.activity;
+    saveAgent(agent);
+    commit();
+  }
   return agent;
 }
 
@@ -345,6 +352,11 @@ async function ensureMain(newMain) {
   }
   if (main && !newMain) {
     throw new Error("主 agent 已丢失或身份不一致；确认不再需要原会话后，用 `daemon --new-main` 启动新的主会话");
+  }
+  if (main) {
+    main.activity = "exited";
+    saveAgent(main);
+    commit();
   }
   const agent = await launchAgent("main", config.main.kind, process.cwd(), "主助手");
   S.meta.main = { agentId: agent.agentId };
@@ -464,6 +476,10 @@ function endTurn(agent, sub) {
     commit();
     if (sub.stop.message) notify("reply", sub.stop.message, { dispatchId: sub.id });
     else notify("dispatch", `主 agent 本轮${sub.stop.error ? "以原生错误结束" : "没有最终消息"}（dispatch ${sub.id}）`);
+    const task = item.type === "worker.turn_ended" && S.tasks[item.taskId];
+    if (task && task.state === "reviewing" && task.latestResultEventId === item.eventId) {
+      notify("task", `${task.title}：结果尚未归类（主助手本轮没有调用 tasks.decide），任务保持 reviewing`, { taskId: task.taskId });
+    }
     return;
   }
   const task = S.tasks[sub.taskId];
@@ -561,9 +577,14 @@ function onHook(ev) {
       break;
     case "StopFailure":
       if (sub && sub.turnKey === key) {
-        sub.stop = { eventId: ev.eventId, message: null, error: p };
+        sub.stop = { eventId: ev.eventId, message: null, error: p, at: now() };
         storeResult(ev.eventId, { kind: agent.kind, error: p });
         saveSub(sub);
+        if (agent.role === "main") {
+          agent.control = "paused";
+          saveAgent(agent);
+          notify("control", `主 agent 遇到原生错误，已暂停自动派发；处理后用控制台 /resume ${agent.agentId} 恢复`);
+        }
       }
       break;
     case "Interrupt":
@@ -748,7 +769,9 @@ async function pollAgent(agentId) {
       if (task) markUncertain(task, "delivery_unknown");
       else notify("dispatch", `dispatch ${sub.id} 写入后没有观察到回合开始；用控制台 /dispatch ${sub.id} handled|resubmit 处理`);
     } else if (sub.status === "observed" && obs.activity === "ready") {
-      if (sub.stop) endTurn(agent, sub);
+      if (sub.stop) {
+        if (readyAfter(Date.parse(sub.stop.at)) >= STOP_SETTLE_MS) endTurn(agent, sub);
+      }
       else if (!sub.bgTaskIds.length && !sub.noResultAt && readyAfter(Date.parse(sub.observedAt)) > STOP_GRACE_MS) endTurnWithoutResult(agent, sub);
     }
   }
@@ -1138,7 +1161,12 @@ const CONSOLE = {
   },
 
   async "task.cancel"({ taskId }) {
-    return cancelTask(needTask(taskId));
+    const task = needTask(taskId);
+    const result = await cancelTask(task);
+    // 主助手不知道控制台操作，用状态通知告知它，避免继续追问已撤回的问题。
+    enqueueUpdate(task, task.state === "cancelled" ? "用户在控制台取消了任务，待回答的问题已撤回" : "用户在控制台请求取消任务，等待确认停止");
+    commit();
+    return result;
   },
 
   // 只能由用户执行：把 uncertain 任务确认为 cancelled 或 failed。
@@ -1159,8 +1187,10 @@ const CONSOLE = {
     task.activeSubmissionId = null;
     task.state = to;
     task.decision = { decision: to, summary: `用户在控制台确认（原因：${task.uncertainReason}）` };
+    task.uncertainReason = null;
     dropPending(task);
     saveTask(task);
+    enqueueUpdate(task, `用户在控制台把 uncertain 任务确认为 ${to}`);
     commit();
     return { task: taskView(task) };
   },
