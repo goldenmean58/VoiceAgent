@@ -935,6 +935,24 @@ macOS 麦克风权限的实测结论：
 
 仍需完成：V16（固定 20 次唤醒的成功率，以及 30 分钟背景音下的误唤醒次数）。
 
+里程碑 D 的实现与验证：
+
+- Herdr 事件订阅：订阅受管 pane 的 `pane.agent_status_changed`，以及全局的 `pane.exited`、`pane.closed`、`pane.agent_detected`，事件只作为立即重查的信号。有在途回合的 agent 每秒检查一次，其余每 10 秒兜底一次。用 lldb 强行关闭 daemon 与 Herdr 之间的订阅连接，daemon 报告中断、暂停新的自动投递，约 1 秒后重新订阅并全量重查，之后恢复投递（V19 的订阅中断部分通过）。
+- 全局 Hook：`install-hooks` 在 `~/.claude/settings.json` 和 `~/.codex/hooks.json` 中追加本应用的条目，先备份、可重复执行、不改动已有 Hook。
+  - daemon 启动的会话：随启动参数注入的 Hook 带 `--launch`；全局 Hook 看到 `VA_AGENT` 环境变量就跳过，避免重复。
+  - 被接管的会话：通过 daemon 写入的 `sessions.json` 识别，写完整事件。
+  - 其他会话：只写会话 ID 等元数据，daemon 只记在内存里，不写 journal。
+- 接管（V20 通过）：`agents.adopt` 依次检查以下各项，全部通过后才登记：
+  - 候选存在，且不是 daemon 自己所在的 pane，也未受管；
+  - 未超过 worker 数量上限，且没有未结束的任务；
+  - cwd 在 allowedRoots 内；
+  - Herdr 报告了原生会话 ID；
+  - 已收到该会话的 Hook 事件；
+  - 会话当前空闲。
+  
+  接管后的会话完成了一个改文件的任务，结果经主助手审阅后汇报。
+- V07 未完成：本机 Claude 默认处于跳过权限模式，接管的会话不会出现权限弹窗。需要用 `--permission-mode default` 启动的会话再测。
+
 开始实现时仍需核验：
 
 1. 主角色说明的加载方式：Claude 的 `--append-system-prompt` 或等价参数，Codex 的对应配置项。
