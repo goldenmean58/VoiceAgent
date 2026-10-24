@@ -306,7 +306,8 @@ def main():
                 emit("state", state="transcribing")
                 t0 = time.monotonic()
                 s = asr.create_stream()
-                s.accept_waveform(SAMPLE_RATE, value)
+                # 实测 SenseVoice 在没有前导静音时会吞掉第一个音节，补 0.3 秒静音。
+                s.accept_waveform(SAMPLE_RATE, np.concatenate([np.zeros(int(0.3 * SAMPLE_RATE), dtype=np.float32), value]))
                 asr.decode_stream(s)
                 text = s.result.text.strip()
                 asr_ms = int((time.monotonic() - t0) * 1000)

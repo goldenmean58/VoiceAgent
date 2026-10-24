@@ -889,7 +889,10 @@ async function scheduleMain() {
 
 // ---------- 语音：音频子进程与播报队列 ----------
 
-let audio = null; // { proc, ready, input, speaking }
+// 音频进程由前台控制台（listen --voice）启动并经 socket 接入：macOS 不会为
+// Herdr 后台服务里的进程弹麦克风授权，只有从有权限的终端 App 启动才能录音。
+let audio = null; // { sock, ready, input, speaking }
+const sendAudio = (cmd) => audio.sock.write(JSON.stringify(cmd) + "\n");
 const FINAL_SPEECH = new Set(["played", "interrupted", "failed", "unknown", "stale"]);
 
 // 本轮通过 ask_user 打开的问题；播报前要核对它仍然开放。
@@ -923,7 +926,7 @@ function pumpSpeech() {
   save("speech", next.speechId, next);
   commit();
   audio.speaking = next.speechId;
-  audio.proc.stdin.write(JSON.stringify({ cmd: "speak", speechId: next.speechId, text: speakable(next.text) }) + "\n");
+  sendAudio({ cmd: "speak", speechId: next.speechId, text: speakable(next.text) });
 }
 
 function setSpeechState(speechId, state, message) {
@@ -978,29 +981,20 @@ function onAudioEvent(ev) {
   }
 }
 
-function startAudio() {
-  const python = path.join(ROOT, "audio", ".venv", "bin", "python");
-  if (!existsSync(python)) throw new Error(`缺少音频环境 ${python}；按 audio/requirements.txt 创建虚拟环境`);
-  const proc = spawn(python, ["-I", path.join(ROOT, "audio", "voice.py"), JSON.stringify(config.voice)], { stdio: ["pipe", "pipe", "pipe"] });
-  audio = { proc, ready: false, input: null, speaking: null };
-  const stderrTail = [];
-  readline.createInterface({ input: proc.stdout }).on("line", (line) => {
-    try {
-      onAudioEvent(JSON.parse(line));
-    } catch (e) {
-      fatal(e);
-    }
-  });
-  readline.createInterface({ input: proc.stderr }).on("line", (line) => {
-    stderrTail.push(line);
-    if (stderrTail.length > 20) stderrTail.shift();
-  });
-  proc.on("exit", (code, signal) => {
-    const speaking = audio?.speaking;
-    audio = null;
-    if (speaking) setSpeechState(speaking, "unknown");
-    notify("voice", `音频进程已退出（${signal ?? code}），语音不可用，文字控制台仍可使用${stderrTail.length ? `\n${stderrTail.join("\n")}` : ""}`);
-  });
+function attachAudio(sock) {
+  if (!config.voice) throw new ToolError("voice_disabled", "配置中没有 voice 段");
+  if (audio) throw new ToolError("audio_busy", "已有音频进程接入；同一时刻只接受一个");
+  audio = { sock, ready: false, input: null, speaking: null };
+  sock.isAudio = true;
+  notify("voice", "音频进程已接入，正在加载模型");
+}
+
+function detachAudio(sock) {
+  if (audio?.sock !== sock) return;
+  const speaking = audio.speaking;
+  audio = null;
+  if (speaking) setSpeechState(speaking, "unknown");
+  notify("voice", "音频进程已断开，语音不可用，文字控制台仍可使用");
 }
 
 function needAudio() {
@@ -1294,13 +1288,15 @@ const CONSOLE = {
   },
 
   async "voice.listen"() {
-    needAudio().proc.stdin.write(JSON.stringify({ cmd: "listen" }) + "\n");
+    needAudio();
+    sendAudio({ cmd: "listen" });
     return { listening: true };
   },
 
   // 停止播放由 daemon 直接处理，不经过主 agent，也不影响任务。
   async "voice.stop"() {
-    needAudio().proc.stdin.write(JSON.stringify({ cmd: "stop_playback" }) + "\n");
+    needAudio();
+    sendAudio({ cmd: "stop_playback" });
     return { stopped: true };
   },
 
@@ -1396,15 +1392,27 @@ function serve() {
   if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH); // 已持有实例锁，旧 socket 必为残留
   const server = net.createServer((sock) => {
     let buf = "";
-    sock.on("error", () => watchers.delete(sock));
-    sock.on("close", () => watchers.delete(sock));
+    const closed = () => {
+      watchers.delete(sock);
+      detachAudio(sock);
+    };
+    sock.on("error", closed);
+    sock.on("close", closed);
     sock.on("data", async (d) => {
       buf += d;
       let nl;
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
-        await respond(sock, line);
+        // 接入后的音频连接只传事件，不再是请求。
+        if (!sock.isAudio) await respond(sock, line);
+        else {
+          try {
+            onAudioEvent(JSON.parse(line));
+          } catch (e) {
+            fatal(e);
+          }
+        }
       }
     });
   });
@@ -1424,6 +1432,10 @@ async function respond(sock, line) {
     if (req.method === "watch") {
       watchers.add(sock);
       return reply({ ok: true, result: { watching: true } });
+    }
+    if (req.method === "audio.attach") {
+      attachAudio(sock);
+      return reply({ ok: true, result: { attached: true, voice: config.voice } });
     }
     let result;
     if (req.method === "tool") result = await handleTool(req.params.action, req.params.input ?? {});
@@ -1486,7 +1498,7 @@ async function daemonCommand(flags) {
     consumeSpool();
     watch(SPOOL_DIR, () => { try { consumeSpool(); } catch (e) { fatal(e); } });
     setInterval(() => { try { consumeSpool(); } catch (e) { fatal(e); } }, 500);
-    if (config.voice) startAudio();
+    if (config.voice) notify("voice", "等待音频进程接入：在有麦克风权限的终端（不在 Herdr 内）运行 `node src/main.mjs listen --voice`");
     else notify("voice", "配置中没有 voice 段，只使用文字控制台");
     await ensureMain(flags.includes("--new-main"));
     setInterval(pollAll, POLL_MS);
@@ -1509,7 +1521,40 @@ const HELP = `输入文字直接发给主助手；直接回车开始录一句话
   /pause <agentId>  /resume <agentId>
   /quit                           退出控制台（不影响 daemon 和 agent）`;
 
-async function listenCommand() {
+// 在当前终端启动音频进程并经 socket 接入 daemon；麦克风权限归属于当前终端 App。
+async function startAudioBridge() {
+  const python = path.join(ROOT, "audio", ".venv", "bin", "python");
+  if (!existsSync(python)) throw new Error(`缺少音频环境 ${python}；按 audio/requirements.txt 创建虚拟环境`);
+  const sock = net.createConnection(SOCKET_PATH);
+  const lines = readline.createInterface({ input: sock });
+  await new Promise((resolve, reject) => {
+    sock.once("connect", resolve);
+    sock.once("error", (e) => reject(new Error(`无法连接 daemon：${e.message}`)));
+  });
+  sock.write(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, rpcId: "audio", method: "audio.attach" }) + "\n");
+  const iter = lines[Symbol.asyncIterator]();
+  const reply = JSON.parse((await iter.next()).value);
+  if (!reply.ok) throw new Error(`音频接入被拒绝：${reply.error.message}`);
+
+  const proc = spawn(python, ["-I", path.join(ROOT, "audio", "voice.py"), JSON.stringify(reply.result.voice)], { stdio: ["pipe", "pipe", "pipe"] });
+  const stderrTail = [];
+  readline.createInterface({ input: proc.stdout }).on("line", (line) => sock.write(line + "\n"));
+  readline.createInterface({ input: proc.stderr }).on("line", (line) => {
+    stderrTail.push(line);
+    if (stderrTail.length > 20) stderrTail.shift();
+  });
+  proc.on("exit", (code, signal) => {
+    process.stdout.write(`\n音频进程已退出（${signal ?? code}）${stderrTail.length ? `：\n${stderrTail.join("\n")}` : ""}\n> `);
+    sock.end();
+  });
+  sock.on("close", () => proc.kill());
+  (async () => {
+    for await (const line of { [Symbol.asyncIterator]: () => iter }) proc.stdin.write(line + "\n");
+  })();
+}
+
+async function listenCommand(flags) {
+  if (flags.includes("--voice")) await startAudioBridge();
   const sock = net.createConnection(SOCKET_PATH);
   await new Promise((resolve, reject) => {
     sock.once("connect", resolve);
@@ -1563,11 +1608,11 @@ async function listenCommand() {
 const [cmd, ...rest] = process.argv.slice(2);
 try {
   if (cmd === "daemon") await daemonCommand(rest);
-  else if (cmd === "listen") await listenCommand();
+  else if (cmd === "listen") await listenCommand(rest);
   else if (cmd === "tool" && rest[0]) await toolCommand(rest[0]);
   else if (cmd === "hook" && KINDS.includes(rest[0]) && rest[1]) hookCommand(rest[0], rest[1]);
   else {
-    process.stderr.write("用法：voice-assistant daemon [--new-main] | listen | tool <action> | hook <claude|codex> <event>\n");
+    process.stderr.write("用法：voice-assistant daemon [--new-main] | listen [--voice] | tool <action> | hook <claude|codex> <event>\n");
     process.exit(2);
   }
 } catch (e) {
