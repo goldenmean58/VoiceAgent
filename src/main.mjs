@@ -1,0 +1,1376 @@
+#!/usr/bin/env node
+// voice-assistant：daemon、控制台、主 agent 工具入口与 Hook 交接。设计见 design.md。
+import { randomUUID, createHash } from "node:crypto";
+import {
+  closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync,
+  renameSync, chmodSync, truncateSync, unlinkSync, writeFileSync, writeSync, watch,
+} from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import readline from "node:readline";
+import { fileURLToPath } from "node:url";
+import * as herdr from "./herdr.mjs";
+
+const SCRIPT = fileURLToPath(import.meta.url);
+const ROOT = path.dirname(path.dirname(SCRIPT));
+const HOME = os.homedir();
+const CONFIG_FILE = path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, ".config"), "voice-assistant", "config.json");
+const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state"), "voice-assistant", "default");
+const SPOOL_DIR = path.join(STATE_DIR, "spool");
+const RESULTS_DIR = path.join(STATE_DIR, "results");
+const LAUNCH_DIR = path.join(STATE_DIR, "launch");
+const SOCKET_PATH = path.join(STATE_DIR, "daemon.sock");
+const LOCK_PATH = path.join(STATE_DIR, "daemon.lock");
+const JOURNAL_PATH = path.join(STATE_DIR, "journal.ndjson");
+const PROTOCOL_VERSION = 1;
+const KINDS = ["claude", "codex"];
+const HOOK_EVENTS = { claude: ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure"], codex: ["SessionStart", "UserPromptSubmit", "Stop", "Interrupt"] };
+const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
+
+const POLL_MS = 1000;
+const DELIVERY_GRACE_MS = 15000; // 写入后迟迟没有 UserPromptSubmit
+const STOP_GRACE_MS = 8000; // 回合已就绪但没有可关联的 Stop
+const CANCEL_TIMEOUT_MS = 30000;
+const SESSION_START_TIMEOUT_MS = 20000;
+
+const now = () => new Date().toISOString();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+class ToolError extends Error {
+  constructor(code, message, extra = {}) {
+    super(message);
+    this.code = code;
+    this.extra = extra;
+  }
+}
+
+function ensureDir(dir) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
+
+function fsyncDir(dir) {
+  const fd = openSync(dir, "r");
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+function writeFileAtomic(file, content) {
+  const tmp = path.join(path.dirname(file), `.tmp-${randomUUID()}`);
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    writeSync(fd, content);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, file);
+  fsyncDir(path.dirname(file));
+}
+
+// ---------- 配置 ----------
+
+function loadConfig() {
+  let c;
+  try {
+    c = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+  } catch (e) {
+    throw new Error(`读取配置 ${CONFIG_FILE} 失败：${e.message}`);
+  }
+  const errs = [];
+  if (c.schemaVersion !== 1) errs.push("schemaVersion 必须为 1");
+  if (c.backend !== "herdr") errs.push('backend 必须为 "herdr"');
+  if (!KINDS.includes(c.main?.kind)) errs.push("main.kind 必须为 claude 或 codex");
+  if (!KINDS.includes(c.worker?.defaultKind)) errs.push("worker.defaultKind 必须为 claude 或 codex");
+  if (c.worker?.maxManaged !== 1) errs.push("worker.maxManaged 第一版只能为 1");
+  if (!Number.isInteger(c.worker?.maxAutoContinue) || c.worker.maxAutoContinue < 0) errs.push("worker.maxAutoContinue 必须为非负整数");
+  const roots = [];
+  if (!Array.isArray(c.projects?.allowedRoots) || c.projects.allowedRoots.length === 0) {
+    errs.push("projects.allowedRoots 必须为非空数组");
+  } else {
+    for (const r of c.projects.allowedRoots) {
+      if (typeof r !== "string" || !path.isAbsolute(r)) { errs.push(`allowedRoots 项必须是绝对路径：${r}`); continue; }
+      try { roots.push(realpathSync(r)); } catch { errs.push(`allowedRoots 路径不存在：${r}`); }
+    }
+  }
+  if (errs.length) throw new Error(`配置 ${CONFIG_FILE} 无效：\n- ${errs.join("\n- ")}`);
+  return { ...c, allowedRoots: roots };
+}
+
+// ---------- journal：单写入者的权威记录 ----------
+
+const S = { agents: {}, tasks: {}, subs: {}, requests: {}, inbox: {}, ops: {}, events: {}, meta: {} };
+let journalFd = null;
+let journalSeq = 0;
+let pendingOps = [];
+
+function loadJournal() {
+  if (!existsSync(JOURNAL_PATH)) return null;
+  const raw = readFileSync(JOURNAL_PATH, "utf8");
+  const lines = raw.split("\n");
+  let offset = 0;
+  let notice = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const isTail = i === lines.length - 1;
+    if (line === "") { offset += 1; continue; }
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      // 最后一行没有换行符且无法解析：视为写入中途崩溃的残片，保留原文后截断。
+      if (isTail) {
+        const fragment = path.join(STATE_DIR, `journal.fragment-${Date.now()}`);
+        writeFileAtomic(fragment, line);
+        truncateSync(JOURNAL_PATH, Buffer.byteLength(raw.slice(0, offset)));
+        notice = `journal 尾部有不完整记录，已保存到 ${fragment} 并截断`;
+        break;
+      }
+      throw new Error(`journal 第 ${i + 1} 行损坏，停止自动运行；请人工检查 ${JOURNAL_PATH}`);
+    }
+    if (rec.seq !== journalSeq + 1) throw new Error(`journal 序号不连续（第 ${i + 1} 行）`);
+    journalSeq = rec.seq;
+    for (const op of rec.ops) {
+      if (op.del) delete S[op.c][op.id];
+      else S[op.c][op.id] = op.v;
+    }
+    offset += Buffer.byteLength(line) + 1;
+  }
+  return notice;
+}
+
+function save(c, id, obj) {
+  pendingOps.push({ c, id, v: JSON.parse(JSON.stringify(obj)) });
+}
+
+function commit() {
+  if (!pendingOps.length) return;
+  const rec = { seq: journalSeq + 1, at: now(), ops: pendingOps };
+  writeSync(journalFd, JSON.stringify(rec) + "\n");
+  fsyncSync(journalFd);
+  journalSeq = rec.seq;
+  pendingOps = [];
+}
+
+const saveAgent = (a) => save("agents", a.agentId, a);
+const saveSub = (s) => save("subs", s.id, s);
+const saveReq = (r) => save("requests", r.requestId, r);
+const saveItem = (i) => save("inbox", i.id, i);
+function saveTask(t) {
+  t.revision += 1;
+  save("tasks", t.taskId, t);
+}
+
+// ---------- Hook：把原生事件交接到 spool ----------
+
+function hookCommand(kind, event) {
+  const input = readFileSync(0, "utf8");
+  let payload;
+  try {
+    payload = JSON.parse(input);
+  } catch {
+    process.stderr.write(`voice-assistant hook: ${kind} ${event} 的输入不是 JSON\n`);
+    process.exit(1);
+  }
+  const [agentId, generation] = (process.env.VA_AGENT || "").split(":");
+  const rec = {
+    schemaVersion: 1,
+    eventId: randomUUID(),
+    receivedAt: now(),
+    kind,
+    hookEvent: event,
+    agentId: agentId || null,
+    generation: generation ? Number(generation) : null,
+    payload,
+  };
+  try {
+    ensureDir(SPOOL_DIR);
+    writeFileAtomic(path.join(SPOOL_DIR, `${Date.now()}-${rec.eventId}.json`), JSON.stringify(rec));
+  } catch (e) {
+    process.stderr.write(`voice-assistant hook: 写入 spool 失败：${e.message}\n`);
+    process.exit(1);
+  }
+  process.stdout.write("{}\n");
+}
+
+// ---------- IPC ----------
+
+function rpc(method, params) {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(SOCKET_PATH);
+    const rpcId = randomUUID();
+    let buf = "";
+    sock.on("error", (e) => reject(new Error(`无法连接 daemon（${SOCKET_PATH}）：${e.message}`)));
+    sock.on("connect", () => sock.write(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, rpcId, method, params }) + "\n"));
+    sock.on("data", (d) => {
+      buf += d;
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      sock.end();
+      resolve(JSON.parse(buf.slice(0, nl)));
+    });
+  });
+}
+
+async function toolCommand(action) {
+  const raw = readFileSync(0, "utf8").trim();
+  let input;
+  try {
+    input = raw ? JSON.parse(raw) : {};
+  } catch {
+    process.stdout.write(JSON.stringify({ ok: false, error: { code: "bad_input", message: "stdin 必须是 JSON 对象" } }) + "\n");
+    process.exit(1);
+  }
+  const res = await rpc("tool", { action, input });
+  process.stdout.write(JSON.stringify(res.ok ? { ok: true, ...res.result } : { ok: false, error: res.error }, null, 2) + "\n");
+  process.exit(res.ok ? 0 : 1);
+}
+
+// ---------- daemon ----------
+
+let config;
+const watchers = new Set();
+const readySince = new Map(); // agentId -> 毫秒，仅内存观察值
+let polling = false;
+let scheduling = false;
+
+function notify(type, text, extra = {}) {
+  const msg = { type, at: now(), text, ...extra };
+  process.stdout.write(`[${msg.at.slice(11, 19)}] ${type}: ${text}\n`);
+  for (const w of watchers) w.write(JSON.stringify(msg) + "\n");
+}
+
+function mainAgent() {
+  return S.meta.main ? S.agents[S.meta.main.agentId] : null;
+}
+
+function managedWorker() {
+  return Object.values(S.agents).find((a) => a.role === "worker" && !a.released && a.activity !== "exited") || null;
+}
+
+function activeSub(agent) {
+  return agent.activeSubmissionId ? S.subs[agent.activeSubmissionId] : null;
+}
+
+function hookCommandLine(kind, event) {
+  return `'${process.execPath}' '${SCRIPT}' hook ${kind} ${event}`;
+}
+
+function renderMainPrompt() {
+  const tool = `'${process.execPath}' '${SCRIPT}' tool`;
+  return readFileSync(path.join(ROOT, "prompts", "main.md"), "utf8").replaceAll("{{TOOL}}", tool);
+}
+
+function launchArgs(role, kind, agentId, nativeSessionId) {
+  if (kind === "claude") {
+    const settings = { hooks: Object.fromEntries(HOOK_EVENTS.claude.map((e) => [e, [{ hooks: [{ type: "command", command: hookCommandLine("claude", e) }] }]])) };
+    const settingsFile = path.join(LAUNCH_DIR, `${agentId}-settings.json`);
+    writeFileAtomic(settingsFile, JSON.stringify(settings, null, 2));
+    const args = ["--dangerously-skip-permissions", "--session-id", nativeSessionId, "--settings", settingsFile];
+    // Herdr 拒绝含换行的启动参数，角色说明经文件传入。
+    if (role === "main") {
+      const promptFile = path.join(LAUNCH_DIR, `${agentId}-prompt.md`);
+      writeFileAtomic(promptFile, renderMainPrompt());
+      args.push("--append-system-prompt-file", promptFile);
+    }
+    return args;
+  }
+  const args = ["--dangerously-bypass-approvals-and-sandbox"];
+  for (const e of HOOK_EVENTS.codex) {
+    args.push("-c", `hooks.${e}=[{hooks=[{type="command",command=${JSON.stringify(hookCommandLine("codex", e))}}]}]`);
+  }
+  if (role === "main") args.push("-c", `developer_instructions=${JSON.stringify(renderMainPrompt())}`);
+  return args;
+}
+
+async function launchAgent(role, kind, cwd, displayName) {
+  const agentId = randomUUID();
+  const generation = 1;
+  const nativeSessionId = kind === "claude" ? randomUUID() : null; // Codex 首轮输入时才有会话 ID
+  const env = { VA_AGENT: `${agentId}:${generation}` };
+  if (kind === "claude") env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
+  // 先登记再启动：SessionStart 可能在 herdr agent start 返回之前到达。
+  const agent = {
+    agentId, role, kind, nativeSessionId, generation, cwd, displayName,
+    control: "managed", activity: "starting", activeSubmissionId: null,
+    backendRef: null, released: false, sessionStarted: false, externalTurnKey: null, createdAt: now(),
+  };
+  S.agents[agentId] = agent;
+  saveAgent(agent);
+  commit();
+  const main = mainAgent();
+  const r = await herdr.start({
+    name: `va-${role}-${agentId.slice(0, 6)}`,
+    kind,
+    cwd,
+    env,
+    args: launchArgs(role, kind, agentId, nativeSessionId),
+    fromRef: role === "worker" ? main.backendRef : null,
+    direction: role === "main" ? "right" : "down",
+  });
+  agent.backendRef = r.backendRef ?? null;
+  if (!r.ok) {
+    agent.activity = "exited";
+    agent.startError = r.reason;
+    saveAgent(agent);
+    commit();
+    throw new ToolError("start_failed", r.reason);
+  }
+  agent.activity = "unknown";
+  saveAgent(agent);
+  commit();
+  if (kind === "claude") {
+    const deadline = Date.now() + SESSION_START_TIMEOUT_MS;
+    while (!S.agents[agentId].sessionStarted) {
+      if (Date.now() > deadline) {
+        agent.activity = "exited";
+        agent.startError = "没有收到 SessionStart Hook";
+        saveAgent(agent);
+        commit();
+        throw new ToolError("start_failed", `${kind} 已启动但 ${SESSION_START_TIMEOUT_MS / 1000}s 内没有收到 SessionStart Hook`);
+      }
+      await sleep(200);
+    }
+  }
+  return agent;
+}
+
+async function ensureMain(newMain) {
+  const main = mainAgent();
+  if (main && main.activity !== "exited") {
+    const obs = await herdr.inspect(main.backendRef, main.kind);
+    if (obs.reachable && obs.present && !(obs.nativeSessionId && main.nativeSessionId && obs.nativeSessionId !== main.nativeSessionId)) {
+      notify("main", `沿用已有主 agent（${main.kind}）`);
+      return;
+    }
+  }
+  if (main && !newMain) {
+    throw new Error("主 agent 已丢失或身份不一致；确认不再需要原会话后，用 `daemon --new-main` 启动新的主会话");
+  }
+  const agent = await launchAgent("main", config.main.kind, process.cwd(), "主助手");
+  S.meta.main = { agentId: agent.agentId };
+  save("meta", "main", S.meta.main);
+  commit();
+  notify("main", `主 agent（${agent.kind}）已就绪`);
+}
+
+// 崩溃恢复：prepared 之后是否写入未知，一律标为 unknown，不自动重发。
+function recoverAfterReplay() {
+  for (const sub of Object.values(S.subs)) {
+    if (sub.status !== "prepared") continue;
+    sub.status = "unknown";
+    saveSub(sub);
+    if (sub.taskId) markUncertain(S.tasks[sub.taskId], "delivery_unknown");
+  }
+  commit();
+  for (const sub of Object.values(S.subs)) {
+    if (sub.role === "main" && sub.status === "unknown" && S.agents[sub.agentId].activeSubmissionId === sub.id) {
+      notify("dispatch", `dispatch ${sub.id} 投递结果不明；用控制台 /dispatch ${sub.id} handled|resubmit 处理`);
+    }
+  }
+}
+
+// ---------- 任务状态 ----------
+
+function markUncertain(task, reason) {
+  task.state = "uncertain";
+  task.uncertainReason = reason;
+  saveTask(task);
+  enqueueUpdate(task, `任务进入 uncertain（${reason}）`);
+}
+
+// 取消请求发出后，即使暂时无法确认而进入 uncertain，之后的回合结束证据仍按取消处理。
+const cancelRequested = (task) => task.state === "cancelling" || (task.state === "uncertain" && task.uncertainReason === "cancel_unconfirmed");
+
+function closeRequest(task, state) {
+  if (!task.pendingRequestId) return;
+  const req = S.requests[task.pendingRequestId];
+  req.state = state;
+  saveReq(req);
+  task.pendingRequestId = null;
+}
+
+function enqueueItem(item) {
+  item.id ??= randomUUID();
+  item.createdAt = now();
+  item.status = "queued";
+  item.seq = journalSeq + pendingOps.length + 1;
+  S.inbox[item.id] = item;
+  saveItem(item);
+  return item;
+}
+
+// 同一任务尚未投递的状态通知只保留最新一条。
+function enqueueUpdate(task, detail) {
+  const queued = Object.values(S.inbox).find((i) => i.status === "queued" && i.type === "worker.task_update" && i.taskId === task.taskId);
+  if (queued) {
+    queued.detail = detail;
+    saveItem(queued);
+  } else {
+    enqueueItem({ type: "worker.task_update", taskId: task.taskId, detail });
+  }
+  notify("task", `${task.title}：${detail}`, { taskId: task.taskId, state: task.state });
+}
+
+async function sendToWorker(task, agent, text) {
+  const sub = {
+    id: randomUUID(), role: "worker", agentId: agent.agentId, taskId: task.taskId, generation: agent.generation,
+    status: "prepared", createdAt: now(), turnKey: null, stop: null, bgTaskIds: [],
+  };
+  sub.text = `[voice-assistant submission=${sub.id}]\n${text}`;
+  S.subs[sub.id] = sub;
+  agent.activeSubmissionId = sub.id;
+  task.activeSubmissionId = sub.id;
+  task.state = "dispatching";
+  task.uncertainReason = null;
+  saveSub(sub);
+  saveAgent(agent);
+  saveTask(task);
+  commit();
+  const r = await herdr.submit(agent.backendRef, sub.text);
+  if (r.status === "written") {
+    sub.status = "written";
+    sub.writtenAt = Date.now();
+    saveSub(sub);
+  } else if (r.status === "rejected") {
+    sub.status = "rejected";
+    agent.activeSubmissionId = null;
+    task.activeSubmissionId = null;
+    task.state = "failed";
+    task.failure = `输入被拒绝：${r.reason}`;
+    saveSub(sub);
+    saveAgent(agent);
+    saveTask(task);
+  } else {
+    sub.status = "unknown";
+    saveSub(sub);
+    markUncertain(task, "delivery_unknown");
+  }
+  commit();
+  return { delivery: sub.status, reason: r.reason };
+}
+
+// 一轮结束（已有可关联的 Stop 且后端观察到就绪）。
+function endTurn(agent, sub) {
+  sub.status = "turn_ended";
+  sub.endedAt = now();
+  agent.activeSubmissionId = null;
+  saveSub(sub);
+  saveAgent(agent);
+  readySince.delete(agent.agentId);
+  if (sub.role === "main") {
+    const item = S.inbox[sub.inboxId];
+    item.status = "done";
+    saveItem(item);
+    commit();
+    if (sub.stop.message) notify("reply", sub.stop.message, { dispatchId: sub.id });
+    else notify("dispatch", `主 agent 本轮${sub.stop.error ? "以原生错误结束" : "没有最终消息"}（dispatch ${sub.id}）`);
+    return;
+  }
+  const task = S.tasks[sub.taskId];
+  task.activeSubmissionId = null;
+  if (cancelRequested(task)) {
+    task.state = "cancelled";
+    task.uncertainReason = null;
+    task.lateResultEventId = sub.stop.eventId;
+    saveTask(task);
+    enqueueUpdate(task, "回合已停止，任务已取消（收到的结果作为迟到事件保留）");
+  } else if (!sub.stop.message && !sub.stop.error) {
+    markUncertain(task, "result_missing");
+  } else {
+    closeRequest(task, "answered");
+    task.state = "reviewing";
+    task.uncertainReason = null;
+    task.latestResultEventId = sub.stop.eventId;
+    saveTask(task);
+    enqueueItem({ type: "worker.turn_ended", taskId: task.taskId, eventId: sub.stop.eventId });
+    notify("task", `${task.title}：工作 agent 本轮结束，等待主助手审阅`, { taskId: task.taskId, state: task.state });
+  }
+  commit();
+}
+
+// 回合就绪但始终没有可关联的 Stop：中断（Claude 无中断 Hook）或结果缺失。
+function endTurnWithoutResult(agent, sub) {
+  const task = sub.taskId && S.tasks[sub.taskId];
+  if (task && !cancelRequested(task)) {
+    // 结果缺失时保留回合关联：迟到的 Stop 仍可把任务转回 reviewing。
+    sub.noResultAt = now();
+    saveSub(sub);
+    if (task.state === "waiting_terminal") {
+      closeRequest(task, "withdrawn");
+      markUncertain(task, "terminal_unresolved");
+    } else if (task.state !== "uncertain") {
+      markUncertain(task, "result_missing");
+    }
+    commit();
+    return;
+  }
+  sub.status = "no_result";
+  agent.activeSubmissionId = null;
+  saveSub(sub);
+  saveAgent(agent);
+  readySince.delete(agent.agentId);
+  if (sub.role === "main") {
+    const item = S.inbox[sub.inboxId];
+    item.status = "done";
+    saveItem(item);
+    commit();
+    notify("dispatch", `主 agent 本轮结束但没有 Stop（可能被中断），dispatch ${sub.id} 无回复`);
+    return;
+  }
+  task.activeSubmissionId = null;
+  task.state = "cancelled";
+  task.uncertainReason = null;
+  saveTask(task);
+  enqueueUpdate(task, "已确认回合停止，任务已取消");
+  commit();
+}
+
+// ---------- Hook 事件处理 ----------
+
+function onHook(ev) {
+  if (S.events[ev.eventId]) return;
+  save("events", ev.eventId, true);
+  S.events[ev.eventId] = true;
+  const agent = S.agents[ev.agentId];
+  if (!agent || agent.generation !== ev.generation) {
+    commit();
+    notify("diag", `忽略不属于受管 agent 的 Hook 事件 ${ev.hookEvent}（${ev.kind}）`);
+    return;
+  }
+  const p = ev.payload;
+  if (agent.nativeSessionId === null && p.session_id) {
+    agent.nativeSessionId = p.session_id;
+    saveAgent(agent);
+  } else if (p.session_id && p.session_id !== agent.nativeSessionId) {
+    identityChanged(agent, `Hook 报告的会话 ${p.session_id} 与绑定的 ${agent.nativeSessionId} 不一致`);
+    commit();
+    return;
+  }
+  const key = agent.kind === "claude" ? p.prompt_id : p.turn_id;
+  const sub = activeSub(agent);
+  switch (ev.hookEvent) {
+    case "SessionStart":
+      agent.sessionStarted = true;
+      saveAgent(agent);
+      break;
+    case "UserPromptSubmit":
+      onPromptSubmit(agent, sub, key, p.prompt ?? "");
+      break;
+    case "Stop":
+      onStop(agent, sub, key, ev);
+      break;
+    case "StopFailure":
+      if (sub && sub.turnKey === key) {
+        sub.stop = { eventId: ev.eventId, message: null, error: p };
+        storeResult(ev.eventId, { kind: agent.kind, error: p });
+        saveSub(sub);
+      }
+      break;
+    case "Interrupt":
+      if (sub && sub.turnKey === key) {
+        const task = sub.taskId && S.tasks[sub.taskId];
+        if (task && cancelRequested(task)) {
+          sub.status = "interrupted";
+          agent.activeSubmissionId = null;
+          task.activeSubmissionId = null;
+          task.state = "cancelled";
+          task.uncertainReason = null;
+          saveSub(sub);
+          saveAgent(agent);
+          saveTask(task);
+          enqueueUpdate(task, "已确认回合被中断，任务已取消");
+        } else {
+          sub.interrupted = true;
+          saveSub(sub);
+        }
+      }
+      break;
+  }
+  commit();
+}
+
+function onPromptSubmit(agent, sub, key, prompt) {
+  if (sub && ["written", "unknown"].includes(sub.status) && prompt.includes(marker(sub))) {
+    sub.status = "observed";
+    sub.turnKey = key;
+    sub.observedAt = now();
+    saveSub(sub);
+    const task = sub.taskId && S.tasks[sub.taskId];
+    if (task && (task.state === "dispatching" || task.state === "uncertain")) {
+      task.state = "running";
+      task.uncertainReason = null;
+      saveTask(task);
+    }
+    if (sub.role === "main" && sub.status === "observed") notify("dispatch", `主 agent 开始处理 dispatch ${sub.id}`);
+    return;
+  }
+  // 后台任务完成后 CLI 自行发起的续轮，归入同一个 submission。
+  if (sub && sub.bgTaskIds.length && prompt.startsWith("<task-notification>") && sub.bgTaskIds.some((id) => prompt.includes(`<task-id>${id}</task-id>`))) {
+    sub.turnKey = key;
+    sub.bgTaskIds = [];
+    saveSub(sub);
+    return;
+  }
+  agent.externalTurnKey = key;
+  agent.externalTurnAt = now();
+  if (agent.role === "worker") {
+    agent.control = "paused";
+    const task = sub && S.tasks[sub.taskId];
+    if (task && !TERMINAL_STATES.has(task.state)) markUncertain(task, "external_input");
+    notify("control", `工作 agent 出现非本系统发起的回合，已暂停自动控制；核验后用 agents.resume 或控制台 /resume ${agent.agentId} 恢复`);
+  } else {
+    notify("control", "主会话出现非本系统发起的回合，暂停投递，回合结束后自动恢复");
+  }
+  saveAgent(agent);
+}
+
+const marker = (sub) => (sub.role === "main" ? `dispatch=${sub.id}` : `submission=${sub.id}`);
+
+function onStop(agent, sub, key, ev) {
+  const p = ev.payload;
+  if (agent.externalTurnKey && agent.externalTurnKey === key) {
+    agent.externalTurnKey = null;
+    saveAgent(agent);
+    if (agent.role === "main") notify("control", "主会话外部回合结束，恢复投递");
+    return;
+  }
+  if (!sub || sub.turnKey !== key) {
+    storeResult(ev.eventId, { kind: agent.kind, message: p.last_assistant_message ?? null, unmatched: true });
+    notify("diag", `收到无法关联的 Stop（${agent.role}），已保留为诊断记录 ${ev.eventId}`);
+    return;
+  }
+  const bg = p.background_tasks ?? [];
+  if (bg.length) {
+    sub.bgTaskIds = bg.map((t) => t.id);
+    sub.stop = null;
+  } else {
+    storeResult(ev.eventId, { kind: agent.kind, message: p.last_assistant_message ?? null });
+    sub.stop = { eventId: ev.eventId, message: p.last_assistant_message || null, at: now() };
+  }
+  saveSub(sub);
+  setImmediate(() => pollAgent(agent.agentId));
+}
+
+function storeResult(eventId, body) {
+  writeFileAtomic(path.join(RESULTS_DIR, `${eventId}.json`), JSON.stringify({ eventId, ...body }));
+}
+
+function readResult(eventId) {
+  return JSON.parse(readFileSync(path.join(RESULTS_DIR, `${eventId}.json`), "utf8"));
+}
+
+function identityChanged(agent, why) {
+  agent.control = "paused";
+  saveAgent(agent);
+  const sub = activeSub(agent);
+  const task = sub?.taskId && S.tasks[sub.taskId];
+  if (task && !TERMINAL_STATES.has(task.state)) markUncertain(task, "session_lost");
+  notify("control", `${agent.role} agent 身份变化，已暂停自动控制：${why}`);
+}
+
+let consuming = false;
+function consumeSpool() {
+  if (consuming) return;
+  consuming = true;
+  try {
+    for (const name of readdirSync(SPOOL_DIR).filter((n) => n.endsWith(".json")).sort()) {
+      const file = path.join(SPOOL_DIR, name);
+      let ev;
+      try {
+        ev = JSON.parse(readFileSync(file, "utf8"));
+      } catch (e) {
+        ensureDir(path.join(SPOOL_DIR, "bad"));
+        renameSync(file, path.join(SPOOL_DIR, "bad", name));
+        notify("diag", `spool 文件 ${name} 无法解析，已移到 spool/bad：${e.message}`);
+        continue;
+      }
+      onHook(ev);
+      unlinkSync(file);
+    }
+  } finally {
+    consuming = false;
+  }
+}
+
+// ---------- 运行状态观察 ----------
+
+async function pollAgent(agentId) {
+  const agent = S.agents[agentId];
+  if (!agent || agent.released || agent.activity === "exited" || agent.activity === "starting") return;
+  const obs = await herdr.inspect(agent.backendRef, agent.kind);
+  if (!obs.reachable) {
+    notify("diag", `无法查询 ${agent.role} agent 状态：${obs.reason}`);
+    return;
+  }
+  if (!obs.present) {
+    agent.activity = "exited";
+    saveAgent(agent);
+    const sub = activeSub(agent);
+    const task = sub?.taskId && S.tasks[sub.taskId];
+    if (task && !TERMINAL_STATES.has(task.state)) markUncertain(task, "session_lost");
+    commit();
+    notify("control", agent.role === "main" ? "主 agent 已退出；停止自动派发" : "工作 agent 已退出");
+    return;
+  }
+  if (obs.nativeSessionId && agent.nativeSessionId && obs.nativeSessionId !== agent.nativeSessionId) {
+    if (agent.control === "managed") {
+      identityChanged(agent, `Herdr 报告会话 ${obs.nativeSessionId}`);
+      commit();
+    }
+    return;
+  }
+  if (agent.activity !== obs.activity) {
+    agent.activity = obs.activity;
+    saveAgent(agent);
+  }
+  if (obs.activity === "ready") {
+    if (!readySince.has(agentId)) readySince.set(agentId, Date.now());
+  } else {
+    readySince.delete(agentId);
+  }
+  // 就绪时长只从当前回合（或外部回合）开始后算起，不继承上一段空闲。
+  const readyAfter = (start) => (obs.activity === "ready" ? Date.now() - Math.max(readySince.get(agentId), start) : 0);
+  const sub = activeSub(agent);
+
+  if (agent.externalTurnKey && readyAfter(Date.parse(agent.externalTurnAt)) > STOP_GRACE_MS) {
+    // 外部回合被中断时没有 Stop；就绪足够久即视为结束。
+    agent.externalTurnKey = null;
+    saveAgent(agent);
+    if (agent.role === "main") notify("control", "主会话外部回合已结束，恢复投递");
+  }
+
+  const task = sub?.taskId && S.tasks[sub.taskId];
+  if (task) trackTerminalState(agent, task, obs.activity);
+  if (sub) {
+    if (sub.status === "written" && readyAfter(sub.writtenAt) > DELIVERY_GRACE_MS) {
+      sub.status = "unknown";
+      saveSub(sub);
+      if (task) markUncertain(task, "delivery_unknown");
+      else notify("dispatch", `dispatch ${sub.id} 写入后没有观察到回合开始；用控制台 /dispatch ${sub.id} handled|resubmit 处理`);
+    } else if (sub.status === "observed" && obs.activity === "ready") {
+      if (sub.stop) endTurn(agent, sub);
+      else if (!sub.bgTaskIds.length && !sub.noResultAt && readyAfter(Date.parse(sub.observedAt)) > STOP_GRACE_MS) endTurnWithoutResult(agent, sub);
+    }
+  }
+  if (task && task.state === "cancelling" && Date.now() - task.cancelRequestedAt > CANCEL_TIMEOUT_MS) {
+    markUncertain(task, "cancel_unconfirmed");
+  }
+  commit();
+}
+
+function trackTerminalState(agent, task, activity) {
+  if (activity === "blocked" && (task.state === "running" || task.state === "dispatching")) {
+    task.state = "waiting_terminal";
+    const req = { requestId: randomUUID(), taskId: task.taskId, generation: agent.generation, type: "terminal_action", question: "工作 agent 的终端需要人工处理", sourceEventId: null, state: "open" };
+    S.requests[req.requestId] = req;
+    task.pendingRequestId = req.requestId;
+    saveReq(req);
+    saveTask(task);
+    enqueueUpdate(task, "工作 agent 的终端出现原生交互，需要用户在对应 pane 处理");
+  } else if (activity === "working" && task.state === "waiting_terminal") {
+    closeRequest(task, "answered");
+    task.state = "running";
+    saveTask(task);
+  }
+}
+
+async function pollAll() {
+  if (polling) return;
+  polling = true;
+  try {
+    for (const a of Object.values(S.agents)) await pollAgent(a.agentId);
+    await scheduleMain();
+  } catch (e) {
+    fatal(e);
+  } finally {
+    polling = false;
+  }
+}
+
+// ---------- 主 agent 调度 ----------
+
+function renderDispatch(item, dispatchId) {
+  if (item.type === "user.message") {
+    return `[voice-assistant dispatch=${dispatchId} message=${item.id} source=user]\n${item.text}`;
+  }
+  const task = S.tasks[item.taskId];
+  const head = `[voice-assistant dispatch=${dispatchId} source=${item.type}]\n` +
+    `task=${task.taskId} title=${JSON.stringify(task.title)} state=${task.state} revision=${task.revision} openRequest=${task.pendingRequestId ?? "none"}`;
+  if (item.type === "worker.turn_ended") {
+    const chars = (readResult(item.eventId).message ?? "").length;
+    return `${head} resultEventId=${item.eventId} resultChars=${chars}\n工作 agent 的这一轮已结束。先用 tasks.get 读取结果原文，再用 tasks.decide 归类，最后给用户简短口播。`;
+  }
+  return `${head}\n${item.detail}`;
+}
+
+async function scheduleMain() {
+  if (scheduling) return;
+  const main = mainAgent();
+  if (!main || main.control !== "managed" || main.activity !== "ready" || main.activeSubmissionId || main.externalTurnKey) return;
+  const item = Object.values(S.inbox).filter((i) => i.status === "queued").sort((a, b) => a.seq - b.seq)[0];
+  if (!item) return;
+  scheduling = true;
+  try {
+    const obs = await herdr.inspect(main.backendRef, main.kind);
+    if (!obs.reachable || !obs.present || obs.activity !== "ready") return;
+    const sub = { id: randomUUID(), role: "main", agentId: main.agentId, inboxId: item.id, generation: main.generation, status: "prepared", createdAt: now(), turnKey: null, stop: null, bgTaskIds: [] };
+    sub.text = renderDispatch(item, sub.id);
+    S.subs[sub.id] = sub;
+    item.status = "dispatched";
+    main.activeSubmissionId = sub.id;
+    saveSub(sub);
+    saveItem(item);
+    saveAgent(main);
+    commit();
+    const r = await herdr.submit(main.backendRef, sub.text);
+    if (r.status === "written") {
+      sub.status = "written";
+      sub.writtenAt = Date.now();
+    } else if (r.status === "rejected") {
+      sub.status = "rejected";
+      item.status = "queued";
+      main.activeSubmissionId = null;
+      saveItem(item);
+      saveAgent(main);
+      notify("dispatch", `主 agent 拒绝输入：${r.reason}；稍后重试`);
+    } else {
+      sub.status = "unknown";
+      notify("dispatch", `dispatch ${sub.id} 写入结果不明：${r.reason}；用控制台 /dispatch ${sub.id} handled|resubmit 处理`);
+    }
+    saveSub(sub);
+    commit();
+  } finally {
+    scheduling = false;
+  }
+}
+
+// ---------- 主 agent 工具 ----------
+
+const SIDE_EFFECT_ACTIONS = new Set(["agents.start", "agents.release", "agents.pause", "agents.resume", "tasks.submit", "tasks.send", "tasks.decide", "tasks.reply", "tasks.cancel"]);
+
+async function handleTool(action, input) {
+  const handler = TOOLS[action];
+  if (!handler) throw new ToolError("unknown_action", `未知 action：${action}`);
+  if (!SIDE_EFFECT_ACTIONS.has(action)) return handler(input);
+
+  const main = mainAgent();
+  const sub = input.dispatchId && S.subs[input.dispatchId];
+  if (!sub || sub.role !== "main" || main.activeSubmissionId !== sub.id || !["written", "observed"].includes(sub.status)) {
+    throw new ToolError("not_active_dispatch", "dispatchId 不是当前在途的主 agent dispatch");
+  }
+  const obs = await herdr.inspect(main.backendRef, main.kind);
+  if (!obs.present || obs.activity !== "working") throw new ToolError("not_active_dispatch", "主 agent 当前不在活动回合中");
+  if (typeof input.operationId !== "string" || !input.operationId) throw new ToolError("bad_input", "缺少 operationId");
+
+  const { dispatchId, operationId, ...args } = input;
+  const digest = createHash("sha256").update(action + JSON.stringify(args)).digest("hex");
+  const prior = S.ops[operationId];
+  if (prior) {
+    if (prior.digest !== digest) throw new ToolError("operation_conflict", "同一 operationId 已用于不同的请求");
+    return prior.result;
+  }
+  const result = await handler(args, dispatchId);
+  const op = { operationId, action, digest, dispatchId, result, at: now() };
+  S.ops[operationId] = op;
+  save("ops", operationId, op);
+  commit();
+  return result;
+}
+
+function needTask(taskId, expectedRevision) {
+  const task = S.tasks[taskId];
+  if (!task) throw new ToolError("not_found", `任务不存在：${taskId}`);
+  if (expectedRevision !== undefined && expectedRevision !== task.revision) {
+    throw new ToolError("revision_mismatch", "任务已变化，请基于最新状态重新判断", { task: taskView(task) });
+  }
+  return task;
+}
+
+function needText(v, field) {
+  if (typeof v !== "string" || !v.trim()) throw new ToolError("bad_input", `缺少 ${field}`);
+  return v;
+}
+
+async function needReadyWorker(agentId) {
+  const agent = S.agents[agentId];
+  if (!agent || agent.role !== "worker" || agent.released) throw new ToolError("not_found", `受管工作 agent 不存在：${agentId}`);
+  if (agent.control !== "managed") throw new ToolError("agent_paused", "工作 agent 处于手动控制，需先核验并恢复");
+  if (agent.activeSubmissionId) throw new ToolError("agent_busy", "工作 agent 还有未结束的回合");
+  const obs = await herdr.inspect(agent.backendRef, agent.kind);
+  if (!obs.present) throw new ToolError("agent_exited", "工作 agent 已退出");
+  if (obs.activity !== "ready") throw new ToolError("agent_busy", `工作 agent 当前状态为 ${obs.activity}`);
+  return agent;
+}
+
+function taskView(task) {
+  const req = task.pendingRequestId && S.requests[task.pendingRequestId];
+  return {
+    taskId: task.taskId, title: task.title, state: task.state, revision: task.revision,
+    uncertainReason: task.uncertainReason, workerAgentId: task.workerAgentId,
+    latestResultEventId: task.latestResultEventId, pendingInputs: task.pendingInputs.length,
+    autoContinueCount: task.autoContinueCount, decision: task.decision ?? null,
+    openRequest: req && req.state === "open" ? { requestId: req.requestId, type: req.type, question: req.question, options: req.options ?? null } : null,
+  };
+}
+
+function agentView(a) {
+  return { agentId: a.agentId, role: a.role, kind: a.kind, cwd: a.cwd, displayName: a.displayName, activity: a.activity, control: a.control, released: a.released };
+}
+
+function withPending(task, text) {
+  const extra = task.pendingInputs.map((t) => `补充要求：${t}`);
+  task.pendingInputs = [];
+  return [text, ...extra].join("\n\n");
+}
+
+function dropPending(task) {
+  const dropped = task.pendingInputs;
+  task.pendingInputs = [];
+  return dropped;
+}
+
+const TOOLS = {
+  async "agents.list"() {
+    const managedRefs = new Set(Object.values(S.agents).map((a) => a.backendRef));
+    const candidates = (await herdr.discover()).filter((c) => !managedRefs.has(c.candidateRef));
+    return { managed: Object.values(S.agents).filter((a) => !a.released && a.activity !== "exited").map(agentView), candidates };
+  },
+
+  async "agents.start"({ kind = config.worker.defaultKind, cwd, name }) {
+    if (!KINDS.includes(kind)) throw new ToolError("bad_input", "kind 必须为 claude 或 codex");
+    let real;
+    try { real = realpathSync(needText(cwd, "cwd")); } catch (e) {
+      if (e instanceof ToolError) throw e;
+      throw new ToolError("bad_input", `目录不存在：${cwd}`);
+    }
+    if (!config.allowedRoots.some((r) => real === r || real.startsWith(r + path.sep))) {
+      throw new ToolError("cwd_not_allowed", `${real} 不在 projects.allowedRoots 内`);
+    }
+    if (managedWorker()) throw new ToolError("worker_limit", "第一版最多管理一个工作 agent；先释放现有工作 agent");
+    const unfinished = Object.values(S.tasks).find((t) => !TERMINAL_STATES.has(t.state));
+    if (unfinished) throw new ToolError("task_unfinished", `仍有未结束的任务 ${unfinished.taskId}（${unfinished.state}）`);
+    const agent = await launchAgent("worker", kind, real, name || `${kind} 工作 agent`);
+    notify("agent", `已启动工作 agent（${kind}，${real}）`);
+    return { agent: agentView(agent) };
+  },
+
+  async "agents.release"({ agentId }) {
+    const agent = S.agents[agentId];
+    if (!agent || agent.role !== "worker" || agent.released) throw new ToolError("not_found", `受管工作 agent 不存在：${agentId}`);
+    const unfinished = Object.values(S.tasks).find((t) => t.workerAgentId === agentId && !TERMINAL_STATES.has(t.state));
+    if (unfinished) throw new ToolError("task_unfinished", `任务 ${unfinished.taskId} 尚未结束（${unfinished.state}）`);
+    if (agent.activeSubmissionId) throw new ToolError("agent_busy", "工作 agent 还有未结束的回合");
+    agent.released = true;
+    saveAgent(agent);
+    commit();
+    return { released: agentId };
+  },
+
+  async "agents.pause"({ agentId }) {
+    const agent = S.agents[agentId];
+    if (!agent || agent.role !== "worker") throw new ToolError("not_found", `工作 agent 不存在：${agentId}`);
+    agent.control = "paused";
+    saveAgent(agent);
+    commit();
+    return { agent: agentView(agent) };
+  },
+
+  async "agents.resume"({ agentId }) {
+    return { agent: agentView(await resumeAgent(agentId)) };
+  },
+
+  async "tasks.submit"({ agentId, originMessageId, title, text }) {
+    const origin = S.inbox[originMessageId];
+    if (!origin || origin.type !== "user.message") throw new ToolError("bad_input", "originMessageId 必须是本轮用户消息的 message id");
+    const dup = Object.values(S.tasks).find((t) => t.originMessageId === originMessageId);
+    if (dup) throw new ToolError("duplicate_origin", "该用户消息已经建过任务", { task: taskView(dup) });
+    const agent = await needReadyWorker(agentId);
+    const unfinished = Object.values(S.tasks).find((t) => t.workerAgentId === agentId && !TERMINAL_STATES.has(t.state));
+    if (unfinished) throw new ToolError("task_unfinished", `工作 agent 已有未结束的任务 ${unfinished.taskId}`, { task: taskView(unfinished) });
+    const task = {
+      taskId: randomUUID(), conversationId: "default", originMessageId, workerAgentId: agentId,
+      title: needText(title, "title"), state: "dispatching", revision: 0, activeSubmissionId: null,
+      pendingRequestId: null, latestResultEventId: null, autoContinueCount: 0, uncertainReason: null,
+      pendingInputs: [], createdAt: now(),
+    };
+    S.tasks[task.taskId] = task;
+    const delivery = await sendToWorker(task, agent, needText(text, "text"));
+    return { task: taskView(task), ...delivery };
+  },
+
+  async "tasks.send"({ taskId, expectedRevision, text }) {
+    const task = needTask(taskId, expectedRevision);
+    if (task.state === "waiting_user") throw new ToolError("use_reply", "任务正在等待用户回答问题；用 tasks.reply 回答，或先取消任务");
+    if (TERMINAL_STATES.has(task.state) || task.state === "uncertain" || task.state === "cancelling") {
+      throw new ToolError("bad_state", `任务处于 ${task.state}，不能追加输入`);
+    }
+    task.pendingInputs.push(needText(text, "text"));
+    task.autoContinueCount = 0;
+    saveTask(task);
+    commit();
+    return { queued: true, task: taskView(task), note: "已排队，未转达；工作 agent 本轮结束后随下一轮投递" };
+  },
+
+  async "tasks.get"({ taskId, offset = 0, limit = 4000 }) {
+    const task = needTask(taskId);
+    const view = taskView(task);
+    if (!task.latestResultEventId) return { task: view, result: null };
+    const res = readResult(task.latestResultEventId);
+    const text = res.message ?? "";
+    const slice = text.slice(offset, offset + limit);
+    const nextOffset = offset + slice.length;
+    return {
+      task: view,
+      result: { eventId: res.eventId, nativeError: res.error ?? null, totalChars: text.length, offset, text: slice, nextOffset, complete: nextOffset >= text.length },
+    };
+  },
+
+  async "tasks.decide"({ taskId, expectedRevision, sourceEventId, decision, text, question, options, summary }) {
+    const task = needTask(taskId, expectedRevision);
+    if (task.state !== "reviewing" || task.latestResultEventId !== sourceEventId) {
+      throw new ToolError("not_pending_result", "sourceEventId 不是该任务当前待处理的结果", { task: taskView(task) });
+    }
+    if (decision === "complete" || decision === "fail") {
+      task.state = decision === "complete" ? "completed" : "failed";
+      task.decision = { decision, summary: needText(summary, "summary"), sourceEventId };
+      const dropped = dropPending(task);
+      saveTask(task);
+      commit();
+      return { task: taskView(task), droppedInputs: dropped };
+    }
+    if (decision === "ask_user") {
+      const req = { requestId: randomUUID(), taskId, generation: S.agents[task.workerAgentId].generation, type: "question", question: needText(question, "question"), options: options ?? null, sourceEventId, state: "open" };
+      S.requests[req.requestId] = req;
+      task.state = "waiting_user";
+      task.pendingRequestId = req.requestId;
+      saveReq(req);
+      saveTask(task);
+      commit();
+      return { task: taskView(task) };
+    }
+    if (decision === "continue") {
+      const hasUserInput = task.pendingInputs.length > 0;
+      if (!hasUserInput && task.autoContinueCount >= config.worker.maxAutoContinue) {
+        throw new ToolError("auto_continue_limit", `已连续自动继续 ${task.autoContinueCount} 次；请向用户提问或给出结论`);
+      }
+      const agent = await needReadyWorker(task.workerAgentId);
+      task.autoContinueCount = hasUserInput ? 0 : task.autoContinueCount + 1;
+      const delivery = await sendToWorker(task, agent, withPending(task, needText(text, "text")));
+      return { task: taskView(task), ...delivery };
+    }
+    throw new ToolError("bad_input", "decision 必须为 complete、fail、ask_user 或 continue");
+  },
+
+  async "tasks.reply"({ requestId, expectedRevision, answer }) {
+    const req = S.requests[requestId];
+    if (!req || req.type !== "question") throw new ToolError("not_found", `问题不存在：${requestId}`);
+    const task = needTask(req.taskId, expectedRevision);
+    if (req.state !== "open" || task.state !== "waiting_user" || task.pendingRequestId !== requestId) {
+      throw new ToolError("request_closed", "该问题已撤回或已回答，不能转达旧回答", { task: taskView(task) });
+    }
+    const agent = await needReadyWorker(task.workerAgentId);
+    if (agent.generation !== req.generation) throw new ToolError("request_closed", "工作会话已变化，问题失效");
+    closeRequest(task, "answered");
+    task.autoContinueCount = 0;
+    const delivery = await sendToWorker(task, agent, withPending(task, needText(answer, "answer")));
+    return { task: taskView(task), ...delivery };
+  },
+
+  async "tasks.cancel"({ taskId, expectedRevision }) {
+    return cancelTask(needTask(taskId, expectedRevision));
+  },
+};
+
+async function cancelTask(task) {
+  if (TERMINAL_STATES.has(task.state) || task.state === "cancelling") throw new ToolError("bad_state", `任务处于 ${task.state}`);
+  const dropped = dropPending(task);
+  if (task.state === "waiting_user" || task.state === "reviewing") {
+    closeRequest(task, "withdrawn");
+    task.state = "cancelled";
+    saveTask(task);
+    commit();
+    return { task: taskView(task), droppedInputs: dropped, stopped: "no_running_turn" };
+  }
+  if (task.state === "uncertain") throw new ToolError("bad_state", "任务处于 uncertain；在控制台用 /resolve 处理");
+  closeRequest(task, "withdrawn");
+  task.state = "cancelling";
+  task.cancelRequestedAt = Date.now();
+  saveTask(task);
+  commit();
+  const worker = S.agents[task.workerAgentId];
+  const r = await herdr.cancel(worker.backendRef, worker.kind);
+  notify("task", `${task.title}：已请求中断（${r.status}）`, { taskId: task.taskId });
+  return { task: taskView(task), droppedInputs: dropped, interrupt: r.status, note: "已请求停止，确认停止后才会标为 cancelled" };
+}
+
+async function resumeAgent(agentId) {
+  const agent = S.agents[agentId];
+  if (!agent || agent.released) throw new ToolError("not_found", `agent 不存在：${agentId}`);
+  const obs = await herdr.inspect(agent.backendRef, agent.kind);
+  if (!obs.present) throw new ToolError("agent_exited", "agent 已退出");
+  if (obs.nativeSessionId && agent.nativeSessionId && obs.nativeSessionId !== agent.nativeSessionId) throw new ToolError("identity_mismatch", "会话身份已变化，不能恢复");
+  if (obs.activity !== "ready") throw new ToolError("agent_busy", `agent 当前状态为 ${obs.activity}，空闲后再恢复`);
+  agent.control = "managed";
+  agent.externalTurnKey = null;
+  saveAgent(agent);
+  commit();
+  return agent;
+}
+
+// ---------- 控制台方法（用户确定性操作） ----------
+
+const CONSOLE = {
+  async "console.send"({ text }) {
+    const item = enqueueItem({ type: "user.message", text: needText(text, "text") });
+    commit();
+    const position = Object.values(S.inbox).filter((i) => i.status === "queued").length;
+    setImmediate(scheduleMain);
+    return { messageId: item.id, position };
+  },
+
+  async status() {
+    return {
+      agents: Object.values(S.agents).filter((a) => !a.released && a.activity !== "exited").map(agentView),
+      tasks: Object.values(S.tasks).filter((t) => !TERMINAL_STATES.has(t.state)).map(taskView),
+      queued: Object.values(S.inbox).filter((i) => i.status === "queued").length,
+      activeDispatch: mainAgent()?.activeSubmissionId ?? null,
+    };
+  },
+
+  async "task.cancel"({ taskId }) {
+    return cancelTask(needTask(taskId));
+  },
+
+  // 只能由用户执行：把 uncertain 任务确认为 cancelled 或 failed。
+  async "task.resolve"({ taskId, to }) {
+    const task = needTask(taskId);
+    if (task.state !== "uncertain") throw new ToolError("bad_state", `任务处于 ${task.state}，不是 uncertain`);
+    if (to !== "cancelled" && to !== "failed") throw new ToolError("bad_input", "to 必须为 cancelled 或 failed");
+    const agent = S.agents[task.workerAgentId];
+    const sub = task.activeSubmissionId && S.subs[task.activeSubmissionId];
+    if (sub) {
+      sub.status = "abandoned";
+      saveSub(sub);
+      if (agent.activeSubmissionId === sub.id) {
+        agent.activeSubmissionId = null;
+        saveAgent(agent);
+      }
+    }
+    task.activeSubmissionId = null;
+    task.state = to;
+    task.decision = { decision: to, summary: `用户在控制台确认（原因：${task.uncertainReason}）` };
+    dropPending(task);
+    saveTask(task);
+    commit();
+    return { task: taskView(task) };
+  },
+
+  async "dispatch.resolve"({ dispatchId, action }) {
+    const sub = S.subs[dispatchId];
+    const main = mainAgent();
+    if (!sub || sub.role !== "main" || sub.status !== "unknown" || main.activeSubmissionId !== sub.id) {
+      throw new ToolError("bad_state", "该 dispatch 不是待处理的未知投递");
+    }
+    if (action !== "handled" && action !== "resubmit") throw new ToolError("bad_input", "action 必须为 handled 或 resubmit");
+    sub.status = "abandoned";
+    main.activeSubmissionId = null;
+    const item = S.inbox[sub.inboxId];
+    item.status = action === "resubmit" ? "queued" : "done";
+    saveSub(sub);
+    saveAgent(main);
+    saveItem(item);
+    commit();
+    setImmediate(scheduleMain);
+    return { dispatchId, action };
+  },
+
+  async "agent.pause"({ agentId }) {
+    const agent = S.agents[agentId];
+    if (!agent) throw new ToolError("not_found", `agent 不存在：${agentId}`);
+    agent.control = "paused";
+    saveAgent(agent);
+    commit();
+    return { agent: agentView(agent) };
+  },
+
+  async "agent.resume"({ agentId }) {
+    return { agent: agentView(await resumeAgent(agentId)) };
+  },
+};
+
+function serve() {
+  if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH); // 已持有实例锁，旧 socket 必为残留
+  const server = net.createServer((sock) => {
+    let buf = "";
+    sock.on("error", () => watchers.delete(sock));
+    sock.on("close", () => watchers.delete(sock));
+    sock.on("data", async (d) => {
+      buf += d;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        await respond(sock, line);
+      }
+    });
+  });
+  server.listen(SOCKET_PATH, () => chmodSync(SOCKET_PATH, 0o600));
+}
+
+async function respond(sock, line) {
+  let req;
+  try {
+    req = JSON.parse(line);
+  } catch {
+    return sock.write(JSON.stringify({ ok: false, error: { code: "bad_request", message: "请求不是 JSON" } }) + "\n");
+  }
+  const reply = (body) => sock.write(JSON.stringify({ rpcId: req.rpcId, ...body }) + "\n");
+  if (req.protocolVersion !== PROTOCOL_VERSION) return reply({ ok: false, error: { code: "bad_version", message: `协议版本必须为 ${PROTOCOL_VERSION}` } });
+  try {
+    if (req.method === "watch") {
+      watchers.add(sock);
+      return reply({ ok: true, result: { watching: true } });
+    }
+    let result;
+    if (req.method === "tool") result = await handleTool(req.params.action, req.params.input ?? {});
+    else if (CONSOLE[req.method]) result = await CONSOLE[req.method](req.params ?? {});
+    else throw new ToolError("unknown_method", `未知方法：${req.method}`);
+    reply({ ok: true, result });
+  } catch (e) {
+    if (e instanceof ToolError) return reply({ ok: false, error: { code: e.code, message: e.message, ...e.extra } });
+    reply({ ok: false, error: { code: "internal", message: e.message } });
+    fatal(e);
+  }
+}
+
+function acquireLock() {
+  try {
+    const fd = openSync(LOCK_PATH, "wx", 0o600);
+    writeSync(fd, String(process.pid));
+    closeSync(fd);
+    return;
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
+  }
+  const pid = Number(readFileSync(LOCK_PATH, "utf8"));
+  try {
+    process.kill(pid, 0);
+    throw new Error(`已有 daemon 实例在运行（pid ${pid}）`);
+  } catch (e) {
+    if (e.code !== "ESRCH") throw e;
+  }
+  unlinkSync(LOCK_PATH);
+  acquireLock();
+}
+
+function releaseLock() {
+  try { unlinkSync(SOCKET_PATH); } catch {}
+  try { unlinkSync(LOCK_PATH); } catch {}
+}
+
+function fatal(e) {
+  process.stderr.write(`daemon 致命错误，停止运行：${e.stack || e.message}\n`);
+  releaseLock();
+  process.exit(1);
+}
+
+async function daemonCommand(flags) {
+  herdr.assertAvailable();
+  config = loadConfig();
+  await herdr.serverStatus();
+  for (const d of [STATE_DIR, SPOOL_DIR, RESULTS_DIR, LAUNCH_DIR]) ensureDir(d);
+  chmodSync(STATE_DIR, 0o700);
+  acquireLock();
+  process.on("SIGINT", () => { releaseLock(); process.exit(0); });
+  process.on("SIGTERM", () => { releaseLock(); process.exit(0); });
+  try {
+    const notice = loadJournal();
+    if (notice) notify("diag", notice);
+    journalFd = openSync(JOURNAL_PATH, "a", 0o600);
+    recoverAfterReplay();
+    serve();
+    consumeSpool();
+    watch(SPOOL_DIR, () => { try { consumeSpool(); } catch (e) { fatal(e); } });
+    setInterval(() => { try { consumeSpool(); } catch (e) { fatal(e); } }, 500);
+    await ensureMain(flags.includes("--new-main"));
+    setInterval(pollAll, POLL_MS);
+    notify("daemon", `就绪；用 \`node ${path.relative(process.cwd(), SCRIPT) || SCRIPT} listen\` 打开控制台`);
+  } catch (e) {
+    releaseLock();
+    throw e;
+  }
+}
+
+// ---------- 控制台 ----------
+
+const HELP = `输入文字直接发给主助手。命令：
+  /status                         查看 agent、未结束任务和排队情况
+  /cancel <taskId>                取消任务
+  /resolve <taskId> cancelled|failed   确认 uncertain 任务的结局
+  /dispatch <dispatchId> handled|resubmit   处理投递结果不明的 dispatch
+  /pause <agentId>  /resume <agentId>
+  /quit                           退出控制台（不影响 daemon 和 agent）`;
+
+async function listenCommand() {
+  const sock = net.createConnection(SOCKET_PATH);
+  await new Promise((resolve, reject) => {
+    sock.once("connect", resolve);
+    sock.once("error", (e) => reject(new Error(`无法连接 daemon：${e.message}`)));
+  });
+  sock.write(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, rpcId: "watch", method: "watch" }) + "\n");
+  let buf = "";
+  sock.on("data", (d) => {
+    buf += d;
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const msg = JSON.parse(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+      if (msg.rpcId === "watch") continue;
+      const prefix = msg.type === "reply" ? "主助手" : msg.type;
+      process.stdout.write(`\n[${msg.at.slice(11, 19)}] ${prefix}：${msg.text}\n> `);
+    }
+  });
+  sock.on("close", () => { process.stdout.write("\ndaemon 连接已断开\n"); process.exit(1); });
+  process.stdout.write(HELP + "\n> ");
+  const rl = readline.createInterface({ input: process.stdin });
+  for await (const raw of rl) {
+    const line = raw.trim();
+    if (!line) { process.stdout.write("> "); continue; }
+    const [cmd, a, b] = line.split(/\s+/);
+    let res;
+    try {
+      if (cmd === "/quit") process.exit(0);
+      else if (cmd === "/status") res = await rpc("status", {});
+      else if (cmd === "/cancel") res = await rpc("task.cancel", { taskId: a });
+      else if (cmd === "/resolve") res = await rpc("task.resolve", { taskId: a, to: b });
+      else if (cmd === "/dispatch") res = await rpc("dispatch.resolve", { dispatchId: a, action: b });
+      else if (cmd === "/pause") res = await rpc("agent.pause", { agentId: a });
+      else if (cmd === "/resume") res = await rpc("agent.resume", { agentId: a });
+      else if (cmd.startsWith("/")) { process.stdout.write(HELP + "\n> "); continue; }
+      else {
+        res = await rpc("console.send", { text: line });
+        if (res.ok) { process.stdout.write(`已收到，等待主助手处理（队列第 ${res.result.position} 位）\n> `); continue; }
+      }
+    } catch (e) {
+      res = { ok: false, error: { message: e.message } };
+    }
+    process.stdout.write((res.ok ? JSON.stringify(res.result, null, 2) : `错误：${res.error.message}`) + "\n> ");
+  }
+}
+
+// ---------- 入口 ----------
+
+const [cmd, ...rest] = process.argv.slice(2);
+try {
+  if (cmd === "daemon") await daemonCommand(rest);
+  else if (cmd === "listen") await listenCommand();
+  else if (cmd === "tool" && rest[0]) await toolCommand(rest[0]);
+  else if (cmd === "hook" && KINDS.includes(rest[0]) && rest[1]) hookCommand(rest[0], rest[1]);
+  else {
+    process.stderr.write("用法：voice-assistant daemon [--new-main] | listen | tool <action> | hook <claude|codex> <event>\n");
+    process.exit(2);
+  }
+} catch (e) {
+  process.stderr.write(`${e.message}\n`);
+  process.exit(1);
+}
