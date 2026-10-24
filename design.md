@@ -106,7 +106,20 @@ flowchart TD
 - 跳过审批不等于跳过 Hook 信任。Codex 的 Hook 仍需按第 9.2 节审核并信任；本设计不使用 `--dangerously-bypass-hook-trust`。
 - 接管的既有会话保留原有权限，不重启它来切换参数；原生弹窗按第 10.3 节处理。
 
-主 agent 成功注册 native session、Hook 和运行状态后，才宣布助手就绪。工作 agent 按需创建为同 tab 的另一个 pane，继承明确的项目目录，创建时保留用户焦点。不自动创建 workspace、tab 或 worktree。
+启动步骤（已在本机实测，见第 17 节）：
+
+1. 用 `herdr pane split --cwd <项目目录> --env VA_AGENT_ID=<agentId> --no-focus` 创建 pane。Claude 会话还要注入 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`。两个 CLI 的 Hook 进程都继承这些环境变量，所以 Hook 事件从第一条起就能按 agentId 归属，不需要按 cwd 或“最近新开的 pane”猜测。
+2. 用 `herdr agent start <name> --kind <kind> --pane <id> -- <权限参数> <角色说明参数>` 启动 CLI。
+3. 启动前做两项预检，任一项不满足就报告原因，不启动：
+   - Claude：目标目录已被信任。未信任时，即使带 `--dangerously-skip-permissions` 也会先弹出目录信任确认，Herdr 报 blocked 和 `agent_not_ready`。
+   - Codex：本应用的 Hook 已经信任，即 `config.toml` 的 `hooks.state` 里有与当前 Hook 哈希一致的记录。未信任时，Codex 启动后先显示 Hook 审核界面，而 Herdr 把这个状态报成 idle，`agent start` 照样返回成功；此时投递的输入会落进审核界面。
+4. 就绪判定：
+   - Claude：收到带匹配 `VA_AGENT_ID` 的 SessionStart 后绑定 nativeSessionId，宣布就绪。
+   - Codex：只在第一次提交输入时触发 SessionStart，Herdr 也在那时才报告会话 ID。因此 Herdr 报告就绪且预检通过即可视为就绪；nativeSessionId 在第一轮的 UserPromptSubmit 中绑定，绑定之前的身份核对见第 4.3 节第 3 条。
+
+关闭后台任务的代价：Bash 命令超时后不会转入后台，而是直接结束；默认超时为 2 分钟，模型最多可设到 10 分钟。需要更长运行时间的项目，通过 `BASH_DEFAULT_TIMEOUT_MS` 或 `BASH_MAX_TIMEOUT_MS` 调整。MCP tasks 和 Monitor 工具不受这个变量控制，仍可能在后台运行，残留情况按第 9.3 节第 6 条处理。[Claude Code 环境变量](https://code.claude.com/docs/en/env-vars)
+
+工作 agent 按需创建为同 tab 的另一个 pane，继承明确的项目目录，创建时保留用户焦点。不自动创建 workspace、tab 或 worktree。
 
 ## 4. 数据模型与不变量
 
@@ -141,7 +154,7 @@ type AgentRecord = {
   agentId: string;
   role: "main" | "worker";
   kind: "claude" | "codex";
-  nativeSessionId: string;
+  nativeSessionId: string | null; // Codex 在第一轮输入前为 null，见第 3.2 节
   generation: number;
   cwd: string;
   control: "managed" | "paused";
@@ -187,7 +200,7 @@ TaskRecord 的 state、activeSubmissionId、pendingRequestId、latestResultEvent
 
 1. 一个主 agent、最多一个受管工作 agent；一个工作 agent 同时最多有一个未结束的任务。
 2. 同一 agent 同时最多有一个自动投递中的回合；主 agent 忙时只排队。
-3. 每次发送前核对 native session、generation、控制权和当前状态。
+3. 每次发送前核对 native session、generation、控制权和当前状态；Codex 首轮尚无 native session 时，改为核对 agentId 环境标记绑定的 pane 占用者未变。
 4. 主 agent 的最终回复才进入 TTS。工作结果必须先交主 agent 处理。
 5. Herdr 的就绪状态不代表任务成功，原生回合结束也不代表业务任务完成。
 6. 发送结果不确定时不自动重发；中断按键已写入不等于任务已取消。
@@ -220,7 +233,7 @@ type StartSpec = {
 type AgentBinding = {
   backendRef: string;
   kind: "claude" | "codex";
-  nativeSessionId: string;
+  nativeSessionId: string | null;
   generation: number;
 };
 
@@ -251,7 +264,7 @@ type BackendChange = {
 
 type SubmitInput = {
   binding: AgentBinding;
-  expectedNativeSessionId: string;
+  expectedNativeSessionId: string | null; // 仅 Codex 首轮允许为 null
   expectedGeneration: number;
   submissionId: string;
   text: string;
@@ -294,7 +307,9 @@ Herdr 区分布局、原始 pane 和被识别的 agent；启动 agent 需要一�
 
 短请求使用现有 Herdr CLI；常驻事件订阅使用其 Unix socket。调用 CLI 用参数数组启动进程，不经过 shell 拼接。协议与字段以目标安装版 schema 为准，初始化检查客户端/服务端兼容性，不自动升级或重启 Herdr。[Herdr Socket API](https://herdr.dev/docs/socket-api/)
 
-不使用阻塞到整项工作结束的 prompt/wait 调用占住主 agent 工具。Herdr 的 wait 反映运行状态，不能精确标识本次业务任务；可用的 completion_seq 也只辅助观察，不能代替 taskId 或原生回合关联。
+不使用阻塞到整项工作结束的 prompt/wait 调用占住主 agent 工具。Herdr 的 wait 反映运行状态，不能精确标识本次业务任务；可用的 completion_seq 也只辅助观察，不能代替 taskId 或原生回合关联。实测表明，回合被中断后 Herdr 同样报告 done，completion_seq 也同样递增，与正常完成无法区分。
+
+Herdr 的状态分类也有盲区：实测中 Codex 的 Hook 审核界面被报告为 idle。因此 Herdr 的 idle 或 done 只能作为“可能可以输入”的信号，就绪判定还需要第 3.2 节的预检和 Hook 证据。
 
 ### 5.3 接管既有 agent
 
@@ -518,7 +533,7 @@ stdout 遵守原生 Hook 协议：Stop 成功只返回合法中立 JSON，例如
 
 | 来源 | 第一版使用的字段/事件 | 注意事项 |
 | --- | --- | --- |
-| Codex | SessionStart、UserPromptSubmit、Stop、Interrupt；session_id、turn_id、prompt、stop_hook_active、last_assistant_message | 最终消息可能为 null；Interrupt 只在主线程活动回合被中断时触发 |
+| Codex | SessionStart、UserPromptSubmit、Stop、Interrupt；session_id、turn_id、prompt、stop_hook_active、last_assistant_message | 最终消息可能为 null；SessionStart 到第一次提交输入时才触发；Interrupt 只在主线程活动回合被中断时触发，且中断时不触发 Stop |
 | Claude Code | SessionStart、UserPromptSubmit、Stop、StopFailure；session_id、prompt_id、prompt、stop_hook_active、last_assistant_message、background_tasks | prompt_id 在首次用户输入前缺失；用户中断不触发 Stop，也没有对应的中断 Hook |
 | 两者 | 缺失的错误/中断事件 | 通过后端状态观察与明确诊断处理，不伪造事件 |
 
@@ -533,14 +548,17 @@ Claude Code 的 Stop 带 last_assistant_message、stop_hook_active 和 backgroun
 3. Codex 使用 turn_id 关联 UserPromptSubmit 与 Stop；Claude 使用 prompt_id 关联二者，并结合单个在途 submission 核对。不能只用最终文本哈希去重，否则同样的回答会误删。
 4. 原始 Hook 事件自带 eventId，重投同一 spool 文件保持该 ID。一次 submission 出现多份冲突 Stop 候选时先保留，核对继续执行边界，不任意取第一份。
 5. 只有最终消息非空、输入对应关系明确、后端观察到回合已结束，才发出 worker.turn_ended。
-6. 外部 Stop Hook 导致继续（stop_hook_active 为 true 的后续 Stop 属于同一回合），或原生事件明确报告仍有后台任务（Claude 的 background_tasks 非空）时，继续等待，不提前宣告结束。第一版不主动开启原生长期后台任务。
+6. 外部 Stop Hook 导致继续时（stop_hook_active 为 true 的后续 Stop 属于同一回合），继续等待，不提前宣告结束。
+   - Claude 会话已注入 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`，常见的后台 Bash 和 subagent 已被关闭。
+   - 若 Stop 中 background_tasks 仍然非空（MCP tasks 或 Monitor），该 submission 保持 running。之后一轮由 CLI 自行发起：UserPromptSubmit 的 prompt 是 `<task-notification>`，其中的 task-id 出现在上一份 background_tasks 里。这一轮和它的 Stop 都归入同一个 submission，直到某份 Stop 的 background_tasks 为空，才视为回合结束。
+   - 实测中未关闭后台任务的 Claude 会把 `sleep 40` 放到后台：第一份 Stop 的消息是“还没结束”，真正的结果出现在新 prompt_id 的下一轮。
 7. 最终消息缺失或无法唯一关联，进入 result_missing/uncertain，保留诊断；终端内容仅供排查，不作为完整最终消息冒充结果。
 
-SessionStart 可能先于 start 操作返回。先按 kind/native session 保存未绑定事件，start/inspect 取得原生身份后再关联；不能按 cwd 或“最近新开的 pane”猜测对象。无法取得原生身份的启动不算助手就绪。
+SessionStart 可能先于 start 操作返回（Claude），也可能直到第一轮输入才出现（Codex）。两种情况都按事件中的 `VA_AGENT_ID` 环境标记归属到 agentId，再记录 native session；没有环境标记的事件只按已绑定的 session 列表匹配，不能按 cwd 或“最近新开的 pane”猜测对象。
 
 ### 9.4 手动输入与控制权
 
-每次自动提交前持久化一条预期输入。原生 UserPromptSubmit 若与预期文本、session 或当前 submission 不匹配，视为非本系统发起的回合。来源可能是手动输入，也可能是 CLI 自己发起的回合，例如 Claude 的定时任务、后台子 agent 回报或跨会话消息。对工作 agent 的处理方式是：将其 control 置为 paused，停止后续自动投递并通知用户核验。若它打断了原有回合关联，同时将任务置为 uncertain；不能继续把后续最终消息归给旧 submission。
+每次自动提交前持久化一条预期输入。原生 UserPromptSubmit 若与预期文本、session 或当前 submission 不匹配，视为非本系统发起的回合。来源可能是手动输入，也可能是 CLI 自己发起的回合，例如 Claude 的定时任务、后台子 agent 回报或跨会话消息。第 9.3 节第 6 条中，与上一份 background_tasks 对应的 task-notification 回合不算在内。对工作 agent 的处理方式是：将其 control 置为 paused，停止后续自动投递并通知用户核验。若它打断了原有回合关联，同时将任务置为 uncertain；不能继续把后续最终消息归给旧 submission。
 
 主 agent 上出现非本系统发起的回合时，不停用语音层：
 
@@ -604,7 +622,12 @@ Herdr blocked 先归为 waiting_terminal，daemon 建立 type=terminal_action �
 
 “停止播放”只终止当前音频，已经运行的编码任务保持原状。“取消当前任务”则撤销未发送输入并请求中断工作回合，不关闭会话、不删除文件、不做回滚。
 
-中断请求送达后进入 cancelling；只有确认旧回合不再运行才能置为 cancelled。超时或失联进入 uncertain，播报“已请求停止，但还无法确认任务停下来了”。取消后收到的旧结果保留为迟到事件，不把任务改回 completed。
+中断请求送达后进入 cancelling；只有确认旧回合不再运行才能置为 cancelled。两个 CLI 都通过 `herdr agent send-keys <agent> esc` 中断当前回合，中断时都不触发 Stop（已实测）。“已停止”的证据如下：
+
+- Codex：收到 turn_id 与当前 submission 一致的 Interrupt Hook。
+- Claude：没有中断 Hook。证据是发出中断后 Herdr 转为 idle 或 done、completion_seq 递增，且该 prompt_id 在一个短观察窗口内没有出现 Stop。如果窗口过后又收到该 prompt_id 的 Stop，按迟到事件保留，不改变 cancelled。
+
+超时或失联进入 uncertain，播报“已请求停止，但还无法确认任务停下来了”。取消后收到的旧结果保留为迟到事件，不把任务改回 completed。
 
 空闲的 waiting_user/reviewing 任务可以直接取消，因为没有正在运行的受管回合。投递结果未知时，取消也不能消除“可能已经执行”的事实。
 
@@ -828,6 +851,8 @@ A/B/C 都是开发里程碑；D 完成后才称第一版满足本设计。实施
 | V25 | 本助手新建主 agent 和工作 agent，并执行一个需要改文件和运行命令的临时项目任务 | 两者均以最大权限参数启动，全程没有审批弹窗；Hook 仍正常触发 |
 | V26 | 任务进入 uncertain 后，原回合恢复，或用户在控制台确认放弃 | 分别转为 running/reviewing 或 cancelled/failed；之后 worker 可以接新任务 |
 | V27 | 工作结果连续要求继续，达到 maxAutoContinue | continue 被拒绝，主 agent 改为向用户提问 |
+| V28 | Claude worker 执行一个超过 40 秒的命令 | 不进入后台；同一 prompt_id 只产生一份 Stop，且 background_tasks 为空；不会提前报完成 |
+| V29 | Codex 新 Hook 未信任，或 Claude 目标目录未信任 | 启动预检直接报告原因，不启动 agent，也不向审核或信任界面投递输入 |
 
 V16 是第一版目标验收线，不是对所有麦克风、口音和环境的性能承诺。记录实际设备、模型版本、短语与阈值，未达标就不能宣称该配置的免手操作已通过。
 
@@ -844,14 +869,27 @@ V16 是第一版目标验收线，不是对所有麦克风、口音和环境的�
 - 本机 CLI 参数（Claude Code 2.1.310、codex-cli 0.164.0）：`claude --dangerously-skip-permissions` 存在；`codex --dangerously-bypass-approvals-and-sandbox` 存在，`--yolo` 是它的隐藏别名，二者同时传入会报错。
 - Herdr：事件不持久、`events_lost` 只关闭该订阅连接、快照与事件没有共同序号，`agent prompt` 可以向 working 状态的 agent 提交且只确认进入队列，`agent wait` 不跟踪单个回合，`completion_seq` 可能被旧服务器省略。
 
-开始实现时先核验以下项目，不需要为本文修改环境：
+2026-10-25 在本机做了实测（Herdr 0.9.5、Claude Code 2.1.310、codex-cli 0.164.0）。Hook 通过 Claude 的 `--settings` 和 Codex 的 `-c hooks.*` 临时注入，没有修改 `config.toml`。
 
-1. 所选 Claude/Codex 安装版支持哪些 Hook、如何加载主角色说明、如何可靠中断一轮。
-2. Herdr 可返回原生 session、启动就绪状态和事件订阅；本程序运行在获授权的 Herdr 上下文中。
-3. 不覆盖已有 Hook；Codex 的 Hook 信任、目标项目信任和可能的 Stop continuation 冲突已被明确处理。
+- 两个 CLI 的 Hook 进程都继承 `herdr pane split --env` 注入的环境变量；`herdr agent start ... -- <参数>` 能透传 CLI 参数。
+- Claude：
+  - SessionStart 在启动时触发，session_id 与 Herdr 的 `agent_session.value` 一致；
+  - UserPromptSubmit 和 Stop 的 prompt_id 一致，prompt 与投递文本完全一致；
+  - Stop 中有 last_assistant_message 和 background_tasks。
+- Codex：SessionStart 到第一次提交输入时才触发；UserPromptSubmit 和 Stop 的 turn_id 一致；Stop 中有 last_assistant_message。
+- 两个 CLI 在最大权限参数下，Hook 中的 permission_mode 都是 `bypassPermissions`，全程没有审批弹窗。
+- 中断：两个 CLI 都用 Esc 中断，都不触发 Stop；Codex 触发带 turn_id 的 Interrupt，Claude 没有对应 Hook。Herdr 在两种情况下都报告 done，completion_seq 递增。
+- Claude 后台任务：不设 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` 时，`sleep 40` 被放到后台，结果出现在自行发起的下一轮；设为 1 后在同一轮完成，background_tasks 为空。
+- Claude 在未信任的目录启动时，会先弹出目录信任确认，跳过权限的参数不会跳过它。
+- Codex 遇到未信任的 Hook 时，启动后先显示 Hook 审核界面，Herdr 却报告 idle。本机已有的 Herdr Codex SessionStart Hook 尚未被信任，所以现有 Codex pane 没有 `agent_session`。
+
+开始实现时仍需核验：
+
+1. 主角色说明的加载方式：Claude 的 `--append-system-prompt` 或等价参数，Codex 的对应配置项。
+2. Herdr 事件订阅在本机的实际行为；本程序运行在获授权的 Herdr 上下文中。
+3. 本应用的 Codex Hook 由用户通过 `/hooks` 信任一次；不覆盖已有 Hook，并处理可能的 Stop continuation 冲突。
 4. Python/音频库/模型组合能在本机加载，中文语音与自定义关键词可运行，设备权限已就绪。
 5. 配置目录、状态目录和 Unix socket 的真实位置，以及本机 fsync/原子替换流程按设计实现。
-6. 以最大权限参数启动后，所选 CLI 版本确实不再弹出审批，并且 Hook 仍然触发（Codex 的 Hook 信任不会被 `--dangerously-bypass-approvals-and-sandbox` 绕过）。
-7. Hook 进程能继承 start 时注入的环境变量：Claude Code 文档已说明会继承，Codex 需要实测。
+6. Claude 中断判定所用观察窗口的取值，需用真实任务校准。
 
 ACP 留给后续有明确消费者时再实现；Herdr 适配器本身不会自动成为 ACP 服务端。接入 QwenAudio 或其他前台时，先明确谁是唯一主协调者，再设计协议，避免两个主 agent 同时决定路由与播报。
