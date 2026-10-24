@@ -109,7 +109,11 @@ flowchart TD
 启动步骤（已在本机实测，见第 17 节）：
 
 1. 用 `herdr pane split --cwd <项目目录> --env VA_AGENT_ID=<agentId> --no-focus` 创建 pane。Claude 会话还要注入 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`。两个 CLI 的 Hook 进程都继承这些环境变量，所以 Hook 事件从第一条起就能按 agentId 归属，不需要按 cwd 或“最近新开的 pane”猜测。
-2. 用 `herdr agent start <name> --kind <kind> --pane <id> -- <权限参数> <角色说明参数>` 启动 CLI。
+2. 用 `herdr agent start <name> --kind <kind> --pane <id> -- <权限参数> <角色说明参数>` 启动 CLI。实现中确认的细节：
+   - 新 pane 的 shell 初始化完成前，Herdr 返回 `agent_pane_busy` 且不发送输入，需等它进入提示符再启动。
+   - Herdr 拒绝含换行的 agent 参数（`invalid_agent_argument`）。Claude 的角色说明用 `--append-system-prompt-file` 传入；Codex 用 `-c developer_instructions=<转义后的单行字符串>`。
+   - Hook 随启动注入：Claude 用 `--settings <文件>`，Codex 用 `-c hooks.<事件>=[...]`。这样不改用户的全局 Hook 配置，只有本助手启动的会话会触发。Codex 的信任按命令哈希记录，命令路径不变，信任就一直有效。
+   - Claude 用 `--session-id <uuid>` 预先指定原生会话 ID。
 3. 启动前做两项预检，任一项不满足就报告原因，不启动：
    - Claude：目标目录已被信任。未信任时，即使带 `--dangerously-skip-permissions` 也会先弹出目录信任确认，Herdr 报 blocked 和 `agent_not_ready`。
    - Codex：本应用的 Hook 已经信任，即 `config.toml` 的 `hooks.state` 里有与当前 Hook 哈希一致的记录。未信任时，Codex 启动后先显示 Hook 审核界面，而 Herdr 把这个状态报成 idle，`agent start` 照样返回成功；此时投递的输入会落进审核界面。
@@ -305,7 +309,7 @@ Herdr 的 `agent prompt` 也接受 working 状态的 agent，成功响应只表�
 
 Herdr 区分布局、原始 pane 和被识别的 agent；启动 agent 需要一个已有 shell pane，创建后应使用返回的 ID。第一版据此把布局放在后端内部。[Herdr agent automation](https://herdr.dev/docs/agent-automation/)
 
-短请求使用现有 Herdr CLI；常驻事件订阅使用其 Unix socket。调用 CLI 用参数数组启动进程，不经过 shell 拼接。协议与字段以目标安装版 schema 为准，初始化检查客户端/服务端兼容性，不自动升级或重启 Herdr。[Herdr Socket API](https://herdr.dev/docs/socket-api/)
+短请求使用现有 Herdr CLI；常驻事件订阅使用其 Unix socket。里程碑 A 先用每秒一次的 inspect 轮询代替事件订阅，socket 订阅在里程碑 D 中与断线恢复一起实现。调用 CLI 用参数数组启动进程，不经过 shell 拼接。协议与字段以目标安装版 schema 为准，初始化检查客户端/服务端兼容性，不自动升级或重启 Herdr。[Herdr Socket API](https://herdr.dev/docs/socket-api/)
 
 不使用阻塞到整项工作结束的 prompt/wait 调用占住主 agent 工具。Herdr 的 wait 反映运行状态，不能精确标识本次业务任务；可用的 completion_seq 也只辅助观察，不能代替 taskId 或原生回合关联。实测表明，回合被中断后 Herdr 同样报告 done，completion_seq 也同样递增，与正常完成无法区分。
 
@@ -522,7 +526,7 @@ Hook 读取 stdin 中的原生 JSON，补充事件身份，写入本地持久 in
 
 正常路径采用很短的同步交接：将完整事件原子写入 spool 并确认落盘后退出，耗时目标在本机正常磁盘条件下低于 100ms。daemon 暂停时仍可交接，后续再消费。写入失败必须返回错误并保留 stderr 诊断，不能报告交接成功。
 
-Hook 配置在用户级生效，会对本机所有 Claude/Codex 会话触发，因此按会话是否受管分别处理：
+本助手启动的会话，Hook 随启动参数注入，只在这些会话中触发（第 3.2 节）。接管既有会话（里程碑 D）时，Hook 需要在用户级配置中生效，会对本机所有 Claude/Codex 会话触发，因此按会话是否受管分别处理：
 
 - 受管或正在启动、接管的会话：写入完整事件。正在启动的会话通过 start 时注入的环境变量标记识别（Hook 进程继承父进程环境）；已受管的会话通过 daemon 维护的已绑定 session 列表识别。
 - 其他会话：只写最小元数据（kind、session_id、事件名、时间），用于确认 Hook 已加载和发现候选，不写 prompt 或最终消息正文。daemon 定期清理不能关联的元数据。
@@ -622,7 +626,7 @@ Herdr blocked 先归为 waiting_terminal，daemon 建立 type=terminal_action �
 
 “停止播放”只终止当前音频，已经运行的编码任务保持原状。“取消当前任务”则撤销未发送输入并请求中断工作回合，不关闭会话、不删除文件、不做回滚。
 
-中断请求送达后进入 cancelling；只有确认旧回合不再运行才能置为 cancelled。两个 CLI 都通过 `herdr agent send-keys <agent> esc` 中断当前回合，中断时都不触发 Stop（已实测）。“已停止”的证据如下：
+中断请求送达后进入 cancelling；只有确认旧回合不再运行才能置为 cancelled。中断按键按 CLI 区分（已实测）：Claude 用 `ctrl+c`，因为它在前台执行 Bash 时 Esc 无法中断；Codex 用 `esc`。两者中断时都不触发 Stop。取消请求发出后，即使任务因超时进入 `uncertain(cancel_unconfirmed)`，之后到达的 Stop 或中断证据仍按取消处理，不把任务转回 reviewing。“已停止”的证据如下：
 
 - Codex：收到 turn_id 与当前 submission 一致的 Interrupt Hook。
 - Claude：没有中断 Hook。证据是发出中断后 Herdr 转为 idle 或 done、completion_seq 递增，且该 prompt_id 在一个短观察窗口内没有出现 Stop。如果窗口过后又收到该 prompt_id 的 Stop，按迟到事件保留，不改变 cancelled。
@@ -882,6 +886,8 @@ V16 是第一版目标验收线，不是对所有麦克风、口音和环境的�
 - Claude 后台任务：不设 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` 时，`sleep 40` 被放到后台，结果出现在自行发起的下一轮；设为 1 后在同一轮完成，background_tasks 为空。
 - Claude 在未信任的目录启动时，会先弹出目录信任确认，跳过权限的参数不会跳过它。
 - Codex 遇到未信任的 Hook 时，启动后先显示 Hook 审核界面，Herdr 却报告 idle。本机已有的 Herdr Codex SessionStart Hook 尚未被信任，所以现有 Codex pane 没有 `agent_session`。
+
+里程碑 A 实现后，用 Claude 作为主 agent 和工作 agent 跑过以下验收场景，均通过：V01、V02、V03、V04、V05、V10、V14、V19（仅 daemon 重启后沿用主 agent、不重发）、V21、V24、V26（控制台 resolve 路径）、V28、V29（Claude 目录未信任）。Codex 路径尚未在 daemon 中端到端运行。
 
 开始实现时仍需核验：
 
