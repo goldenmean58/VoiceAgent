@@ -1,6 +1,8 @@
 // Herdr 后端：只向应用暴露 discover/start/inspect/submit/cancel。
 // pane、terminal、agent 名称和 Herdr 错误码都留在本文件内；backendRef 对业务代码不透明。
 import { execFile } from "node:child_process";
+import net from "node:net";
+import readline from "node:readline";
 
 function run(args, { timeoutMs = 30000, json = true } = {}) {
   return new Promise((resolve) => {
@@ -42,9 +44,39 @@ function observe(pane, kind) {
 }
 
 export function assertAvailable() {
-  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) {
-    throw new Error("必须在 Herdr 管理的 pane 中运行（HERDR_ENV=1 且有 HERDR_PANE_ID）");
+  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID || !process.env.HERDR_SOCKET_PATH) {
+    throw new Error("必须在 Herdr 管理的 pane 中运行（HERDR_ENV=1，且有 HERDR_PANE_ID 和 HERDR_SOCKET_PATH）");
   }
+}
+
+// 订阅这些 agent 的状态变化以及全局 pane 退出/关闭。事件不持久、没有与快照共享的序号，
+// 只作为"需要重新检查"的信号：onChange({ reason: "started" }) 表示订阅已建立，调用方应全量
+// 重新检查；onChange({ backendRef }) 表示该对象可能变化；onClose(reason) 后订阅失效。
+export function subscribe(backendRefs, onChange, onClose) {
+  const byPane = new Map(backendRefs.map((ref) => [JSON.parse(ref).paneId, ref]));
+  const sock = net.createConnection(process.env.HERDR_SOCKET_PATH);
+  let closedReason = "connection_closed";
+  sock.on("connect", () => {
+    const subscriptions = [...byPane.keys()].map((pane_id) => ({ type: "pane.agent_status_changed", pane_id }));
+    subscriptions.push({ type: "pane.exited" }, { type: "pane.closed" }, { type: "pane.agent_detected" });
+    sock.write(JSON.stringify({ id: "va-sub", method: "events.subscribe", params: { subscriptions } }) + "\n");
+  });
+  readline.createInterface({ input: sock }).on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.error) {
+      closedReason = msg.error.code;
+      return;
+    }
+    if (msg.result?.type === "subscription_started") return onChange({ reason: "started" });
+    const ref = byPane.get(msg.data?.pane_id);
+    if (ref) onChange({ backendRef: ref, reason: msg.event });
+  });
+  sock.on("error", (e) => (closedReason = e.code || e.message));
+  sock.on("close", () => onClose(closedReason));
+  return () => {
+    sock.removeAllListeners("close");
+    sock.destroy();
+  };
 }
 
 export async function serverStatus() {

@@ -30,6 +30,7 @@ const HOOK_EVENTS = { claude: ["SessionStart", "UserPromptSubmit", "Stop", "Stop
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
 
 const POLL_MS = 1000;
+const IDLE_POLL_MS = 10000; // 没有在途回合时的兜底检查间隔
 const DELIVERY_GRACE_MS = 15000; // 写入后迟迟没有 UserPromptSubmit
 const STOP_GRACE_MS = 8000; // 回合已就绪但没有可关联的 Stop
 const STOP_SETTLE_MS = 1500; // Stop 之后需持续就绪这么久才算回合结束，防止 Stop 后回合继续
@@ -817,16 +818,69 @@ function trackTerminalState(agent, task, activity) {
   }
 }
 
+// 有在途回合或外部回合的 agent 每轮都查（超时窗口靠它计时），其余低频兜底；
+// 订阅事件到达时立即查对应 agent。
+const lastPolled = new Map();
+const watched = (a) => !a.released && a.activity !== "exited" && a.activity !== "starting";
+
 async function pollAll() {
   if (polling) return;
   polling = true;
   try {
-    for (const a of Object.values(S.agents)) await pollAgent(a.agentId);
+    ensureSubscription();
+    for (const a of Object.values(S.agents)) {
+      if (!watched(a)) continue;
+      if (!a.activeSubmissionId && !a.externalTurnKey && Date.now() - (lastPolled.get(a.agentId) ?? 0) < IDLE_POLL_MS) continue;
+      lastPolled.set(a.agentId, Date.now());
+      await pollAgent(a.agentId);
+    }
     await scheduleMain();
   } catch (e) {
     fatal(e);
   } finally {
     polling = false;
+  }
+}
+
+// ---------- Herdr 事件订阅 ----------
+
+let unsubscribe = null;
+let subscribedKey = null;
+let herdrSynced = false; // 订阅建立并完成全量检查之前，暂停新的自动投递
+
+function ensureSubscription() {
+  const refs = Object.values(S.agents).filter(watched).map((a) => a.backendRef).sort();
+  const key = refs.join("|");
+  if (unsubscribe && key === subscribedKey) return;
+  unsubscribe?.();
+  subscribedKey = key;
+  herdrSynced = false;
+  unsubscribe = herdr.subscribe(refs, onBackendChange, (reason) => {
+    unsubscribe = null;
+    herdrSynced = false;
+    notify("diag", `Herdr 事件订阅中断（${reason}），暂停新的自动投递并重新订阅`);
+    setTimeout(() => {
+      try { ensureSubscription(); } catch (e) { fatal(e); }
+    }, 1000);
+  });
+}
+
+async function onBackendChange(change) {
+  try {
+    if (change.reason === "started") {
+      // 快照与事件没有共同序号：以订阅建立后的一次全量检查为准。
+      for (const a of Object.values(S.agents)) if (watched(a)) await pollAgent(a.agentId);
+      herdrSynced = true;
+      await scheduleMain();
+      return;
+    }
+    const agent = Object.values(S.agents).find((a) => a.backendRef === change.backendRef && watched(a));
+    if (!agent) return;
+    lastPolled.set(agent.agentId, Date.now());
+    await pollAgent(agent.agentId);
+    await scheduleMain();
+  } catch (e) {
+    fatal(e);
   }
 }
 
@@ -849,7 +903,7 @@ function renderDispatch(item, dispatchId) {
 async function scheduleMain() {
   if (scheduling) return;
   const main = mainAgent();
-  if (!main || main.control !== "managed" || main.activity !== "ready" || main.activeSubmissionId || main.externalTurnKey) return;
+  if (!herdrSynced || !main || main.control !== "managed" || main.activity !== "ready" || main.activeSubmissionId || main.externalTurnKey) return;
   const item = Object.values(S.inbox).filter((i) => i.status === "queued").sort((a, b) => a.seq - b.seq)[0];
   if (!item) return;
   scheduling = true;
@@ -1055,6 +1109,7 @@ async function needReadyWorker(agentId) {
   if (!agent || agent.role !== "worker" || agent.released) throw new ToolError("not_found", `受管工作 agent 不存在：${agentId}`);
   if (agent.control !== "managed") throw new ToolError("agent_paused", "工作 agent 处于手动控制，需先核验并恢复");
   if (agent.activeSubmissionId) throw new ToolError("agent_busy", "工作 agent 还有未结束的回合");
+  if (!herdrSynced) throw new ToolError("backend_resyncing", "Herdr 事件订阅正在恢复，暂停新的自动投递；稍后重试");
   const obs = await herdr.inspect(agent.backendRef, agent.kind);
   if (!obs.present) throw new ToolError("agent_exited", "工作 agent 已退出");
   if (obs.activity !== "ready") throw new ToolError("agent_busy", `工作 agent 当前状态为 ${obs.activity}`);
