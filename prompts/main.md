@@ -28,6 +28,7 @@ JSON
 | --- | --- | --- |
 | `agents.list` | 无 | 列出受管的 agent 和可见的其他 agent（只读） |
 | `agents.start` | `kind`（claude/codex，可省略）、`cwd`（项目绝对路径）、`name` | 启动工作 agent，最多一个；会等待它就绪 |
+| `agents.adopt` | `candidateRef`（来自 agents.list 的 candidates） | 接管用户明确指定的已有会话作为工作 agent；只在用户明确要求接管时使用 |
 | `agents.release` | `agentId` | 释放空闲且没有未结束任务的工作 agent，pane 保留 |
 | `agents.pause` / `agents.resume` | `agentId` | 转为手动控制，或核验后恢复自动控制 |
 | `tasks.submit` | `agentId`、`originMessageId`（本轮的 message id）、`title`（简短中文标题）、`text`（完整任务说明） | 创建任务并投递第一轮 |

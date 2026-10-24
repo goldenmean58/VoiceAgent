@@ -24,6 +24,7 @@ const LAUNCH_DIR = path.join(STATE_DIR, "launch");
 const SOCKET_PATH = path.join(STATE_DIR, "daemon.sock");
 const LOCK_PATH = path.join(STATE_DIR, "daemon.lock");
 const JOURNAL_PATH = path.join(STATE_DIR, "journal.ndjson");
+const REGISTRY_PATH = path.join(STATE_DIR, "sessions.json"); // 被接管会话的 nativeSessionId → agentId，供全局 Hook 识别
 const PROTOCOL_VERSION = 1;
 const KINDS = ["claude", "codex"];
 const HOOK_EVENTS = { claude: ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure"], codex: ["SessionStart", "UserPromptSubmit", "Stop", "Interrupt"] };
@@ -176,7 +177,10 @@ function saveTask(t) {
 
 // ---------- Hook：把原生事件交接到 spool ----------
 
-function hookCommand(kind, event) {
+// 两种来源：daemon 启动会话时随参数注入的 Hook（带 --launch，身份来自 VA_AGENT 环境变量），
+// 以及用户级配置里的全局 Hook（用于接管既有会话，身份来自 daemon 维护的 sessions.json）。
+// 全局 Hook 对未受管会话只记录元数据，不写 prompt 或回复正文。
+function hookCommand(kind, event, flags) {
   const input = readFileSync(0, "utf8");
   let payload;
   try {
@@ -185,16 +189,29 @@ function hookCommand(kind, event) {
     process.stderr.write(`voice-assistant hook: ${kind} ${event} 的输入不是 JSON\n`);
     process.exit(1);
   }
-  const [agentId, generation] = (process.env.VA_AGENT || "").split(":");
+  let [agentId, generation] = (process.env.VA_AGENT || "").split(":");
+  const launched = flags.includes("--launch");
+  if (!launched && agentId) {
+    process.stdout.write("{}\n"); // daemon 启动的会话已由随参数注入的 Hook 记录
+    return;
+  }
+  let full = launched;
+  if (!launched) {
+    const entry = existsSync(REGISTRY_PATH) && JSON.parse(readFileSync(REGISTRY_PATH, "utf8"))[payload.session_id];
+    if (entry) {
+      [agentId, generation, full] = [entry.agentId, String(entry.generation), true];
+    }
+  }
   const rec = {
     schemaVersion: 1,
     eventId: randomUUID(),
     receivedAt: now(),
     kind,
     hookEvent: event,
-    agentId: agentId || null,
-    generation: generation ? Number(generation) : null,
-    payload,
+    agentId: full ? agentId : null,
+    generation: full ? Number(generation) : null,
+    metadata: !full,
+    payload: full ? payload : { session_id: payload.session_id },
   };
   try {
     ensureDir(SPOOL_DIR);
@@ -204,6 +221,35 @@ function hookCommand(kind, event) {
     process.exit(1);
   }
   process.stdout.write("{}\n");
+}
+
+// 在用户级配置中追加全局 Hook（接管既有会话需要）。只追加本应用的条目，不改动已有 Hook。
+function installHooks() {
+  const targets = [
+    { kind: "claude", file: path.join(HOME, ".claude", "settings.json") },
+    { kind: "codex", file: path.join(process.env.CODEX_HOME || path.join(HOME, ".codex"), "hooks.json") },
+  ];
+  for (const { kind, file } of targets) {
+    const raw = existsSync(file) ? readFileSync(file, "utf8") : null;
+    const cfg = raw ? JSON.parse(raw) : {};
+    cfg.hooks ??= {};
+    let added = 0;
+    for (const event of HOOK_EVENTS[kind]) {
+      const command = hookCommandLine(kind, event, false);
+      const groups = (cfg.hooks[event] ??= []);
+      if (groups.some((g) => g.hooks?.some((h) => h.command === command))) continue;
+      groups.push({ hooks: [{ type: "command", command, timeout: 10 }] });
+      added += 1;
+    }
+    if (!added) {
+      console.log(`${file}：已安装，未改动`);
+      continue;
+    }
+    if (raw) writeFileSync(`${file}.bak-voice-assistant-${Date.now()}`, raw);
+    writeFileAtomic(file, JSON.stringify(cfg, null, 2) + "\n");
+    console.log(`${file}：追加 ${added} 条 Hook${raw ? "，原文件已备份" : ""}`);
+  }
+  console.log("Codex 需要在会话中用 /hooks 信任新增的 Hook 后才会执行。");
 }
 
 // ---------- IPC ----------
@@ -265,8 +311,8 @@ function activeSub(agent) {
   return agent.activeSubmissionId ? S.subs[agent.activeSubmissionId] : null;
 }
 
-function hookCommandLine(kind, event) {
-  return `'${process.execPath}' '${SCRIPT}' hook ${kind} ${event}`;
+function hookCommandLine(kind, event, launched = true) {
+  return `'${process.execPath}' '${SCRIPT}' hook ${kind} ${event}${launched ? " --launch" : ""}`;
 }
 
 function renderMainPrompt() {
@@ -564,7 +610,23 @@ function endTurnWithoutResult(agent, sub) {
 
 // ---------- Hook 事件处理 ----------
 
+// 未受管会话的元数据事件：只记在内存里，用于确认该会话的全局 Hook 已生效，不写 journal。
+const seenSessions = new Map();
+
+// 全局 Hook 据此把被接管会话的事件写成完整事件。
+function writeRegistry() {
+  const reg = {};
+  for (const a of Object.values(S.agents)) {
+    if (a.adopted && watched(a) && a.nativeSessionId) reg[a.nativeSessionId] = { agentId: a.agentId, generation: a.generation };
+  }
+  writeFileAtomic(REGISTRY_PATH, JSON.stringify(reg));
+}
+
 function onHook(ev) {
+  if (ev.metadata) {
+    seenSessions.set(ev.payload.session_id, { kind: ev.kind, hookEvent: ev.hookEvent, at: ev.receivedAt });
+    return;
+  }
   if (S.events[ev.eventId]) return;
   save("events", ev.eventId, true);
   S.events[ev.eventId] = true;
@@ -751,6 +813,7 @@ async function pollAgent(agentId) {
     const task = sub?.taskId && S.tasks[sub.taskId];
     if (task && !TERMINAL_STATES.has(task.state)) markUncertain(task, "session_lost");
     commit();
+    if (agent.adopted) writeRegistry();
     notify("control", agent.role === "main" ? "主 agent 已退出；停止自动派发" : "工作 agent 已退出");
     return;
   }
@@ -1059,7 +1122,7 @@ function needAudio() {
 
 // ---------- 主 agent 工具 ----------
 
-const SIDE_EFFECT_ACTIONS = new Set(["agents.start", "agents.release", "agents.pause", "agents.resume", "tasks.submit", "tasks.send", "tasks.decide", "tasks.reply", "tasks.cancel"]);
+const SIDE_EFFECT_ACTIONS = new Set(["agents.start", "agents.adopt", "agents.release", "agents.pause", "agents.resume", "tasks.submit", "tasks.send", "tasks.decide", "tasks.reply", "tasks.cancel"]);
 
 async function handleTool(action, input) {
   const handler = TOOLS[action];
@@ -1177,7 +1240,40 @@ const TOOLS = {
     agent.released = true;
     saveAgent(agent);
     commit();
+    if (agent.adopted) writeRegistry();
     return { released: agentId };
+  },
+
+  // 按设计第 5.3 节接管用户明确指定的既有会话；任一检查不通过都不接管。
+  async "agents.adopt"({ candidateRef }) {
+    const cand = (await herdr.discover()).find((c) => c.candidateRef === candidateRef);
+    if (!cand) throw new ToolError("not_found", "找不到该候选会话，可能已退出；请重新 agents.list");
+    if (cand.isCaller) throw new ToolError("not_adoptable", "这是 daemon 自己所在的会话，不能接管");
+    if (Object.values(S.agents).some((a) => a.backendRef === candidateRef && watched(a))) throw new ToolError("already_managed", "该会话已经受管");
+    if (!KINDS.includes(cand.kind)) throw new ToolError("unsupported_kind", `不支持接管 ${cand.kind}`);
+    if (managedWorker()) throw new ToolError("worker_limit", "第一版最多管理一个工作 agent；先释放现有工作 agent");
+    const unfinished = Object.values(S.tasks).find((t) => !TERMINAL_STATES.has(t.state));
+    if (unfinished) throw new ToolError("task_unfinished", `仍有未结束的任务 ${unfinished.taskId}（${unfinished.state}）`);
+    let real;
+    try { real = realpathSync(cand.cwd); } catch { throw new ToolError("bad_input", `会话目录不存在：${cand.cwd}`); }
+    if (!config.allowedRoots.some((r) => real === r || real.startsWith(r + path.sep))) throw new ToolError("cwd_not_allowed", `${real} 不在 projects.allowedRoots 内`);
+    if (!cand.nativeSessionId) throw new ToolError("no_native_session", "Herdr 没有报告该会话的原生 session ID（Codex 需先信任 Herdr 的 Hook 并进行过一轮对话）");
+    if (!seenSessions.has(cand.nativeSessionId)) {
+      throw new ToolError("hook_not_verified", "还没收到该会话的 Hook 事件，无法确认 Hook 已生效；请在该会话里进行一轮对话（Codex 需先用 /hooks 信任），再重试");
+    }
+    const obs = await herdr.inspect(candidateRef, cand.kind);
+    if (!obs.present || obs.activity !== "ready") throw new ToolError("agent_busy", `该会话当前状态为 ${obs.activity}；空闲且没有原生弹窗时才能接管`);
+    const agent = {
+      agentId: randomUUID(), role: "worker", kind: cand.kind, nativeSessionId: cand.nativeSessionId, generation: 1, cwd: real,
+      displayName: `接管的 ${cand.kind} 会话`, control: "managed", activity: "ready", activeSubmissionId: null,
+      backendRef: candidateRef, released: false, sessionStarted: true, externalTurnKey: null, adopted: true, createdAt: now(),
+    };
+    S.agents[agent.agentId] = agent;
+    saveAgent(agent);
+    commit();
+    writeRegistry();
+    notify("agent", `已接管 ${cand.kind} 会话（${real}）`);
+    return { agent: agentView(agent) };
   },
 
   async "agents.pause"({ agentId }) {
@@ -1549,6 +1645,7 @@ async function daemonCommand(flags) {
     if (notice) notify("diag", notice);
     journalFd = openSync(JOURNAL_PATH, "a", 0o600);
     recoverAfterReplay();
+    writeRegistry();
     serve();
     consumeSpool();
     watch(SPOOL_DIR, () => { try { consumeSpool(); } catch (e) { fatal(e); } });
@@ -1665,9 +1762,10 @@ try {
   if (cmd === "daemon") await daemonCommand(rest);
   else if (cmd === "listen") await listenCommand(rest);
   else if (cmd === "tool" && rest[0]) await toolCommand(rest[0]);
-  else if (cmd === "hook" && KINDS.includes(rest[0]) && rest[1]) hookCommand(rest[0], rest[1]);
+  else if (cmd === "hook" && KINDS.includes(rest[0]) && rest[1]) hookCommand(rest[0], rest[1], rest.slice(2));
+  else if (cmd === "install-hooks") installHooks();
   else {
-    process.stderr.write("用法：voice-assistant daemon [--new-main] | listen [--voice] | tool <action> | hook <claude|codex> <event>\n");
+    process.stderr.write("用法：voice-assistant daemon [--new-main] | listen [--voice] | tool <action> | hook <claude|codex> <event> | install-hooks\n");
     process.exit(2);
   }
 } catch (e) {

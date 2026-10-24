@@ -95,6 +95,7 @@ export async function discover() {
     nativeSessionId: a.agent_session?.value ?? null,
     cwd: a.cwd,
     activity: activityOf(a.agent_status),
+    isCaller: a.pane_id === process.env.HERDR_PANE_ID, // daemon 自己所在的 pane，不能被接管
   }));
 }
 
