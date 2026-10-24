@@ -5,6 +5,7 @@ import {
   closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync,
   renameSync, chmodSync, truncateSync, unlinkSync, writeFileSync, writeSync, watch,
 } from "node:fs";
+import { spawn } from "node:child_process";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -93,13 +94,24 @@ function loadConfig() {
       try { roots.push(realpathSync(r)); } catch { errs.push(`allowedRoots 路径不存在：${r}`); }
     }
   }
+  // voice 段可省略：省略时只有文字控制台，不启动音频进程。
+  if (c.voice !== undefined) {
+    const v = c.voice;
+    for (const k of ["displayName", "wakePhrase"]) if (typeof v[k] !== "string" || !v[k]) errs.push(`voice.${k} 必须为非空字符串`);
+    if (typeof v.modelManifest !== "string" || !path.isAbsolute(v.modelManifest) || !existsSync(v.modelManifest)) {
+      errs.push(`voice.modelManifest 必须是已存在的绝对路径：${v.modelManifest}`);
+    }
+    for (const k of ["playbackGuardMs", "waitForSpeechMs", "endSilenceMs", "maxUtteranceMs"]) {
+      if (!Number.isInteger(v[k]) || v[k] <= 0) errs.push(`voice.${k} 必须为正整数`);
+    }
+  }
   if (errs.length) throw new Error(`配置 ${CONFIG_FILE} 无效：\n- ${errs.join("\n- ")}`);
   return { ...c, allowedRoots: roots };
 }
 
 // ---------- journal：单写入者的权威记录 ----------
 
-const S = { agents: {}, tasks: {}, subs: {}, requests: {}, inbox: {}, ops: {}, events: {}, meta: {} };
+const S = { agents: {}, tasks: {}, subs: {}, requests: {}, inbox: {}, ops: {}, events: {}, meta: {}, speech: {} };
 let journalFd = null;
 let journalSeq = 0;
 let pendingOps = [];
@@ -366,7 +378,13 @@ async function ensureMain(newMain) {
 }
 
 // 崩溃恢复：prepared 之后是否写入未知，一律标为 unknown，不自动重发。
+// 未播完的播报标为 unknown，不在重启后自动重播。
 function recoverAfterReplay() {
+  for (const sp of Object.values(S.speech)) {
+    if (FINAL_SPEECH.has(sp.state)) continue;
+    sp.state = "unknown";
+    save("speech", sp.speechId, sp);
+  }
   for (const sub of Object.values(S.subs)) {
     if (sub.status !== "prepared") continue;
     sub.status = "unknown";
@@ -473,9 +491,11 @@ function endTurn(agent, sub) {
     const item = S.inbox[sub.inboxId];
     item.status = "done";
     saveItem(item);
+    if (sub.stop.message) enqueueSpeech(sub.stop.message, sub.id);
     commit();
     if (sub.stop.message) notify("reply", sub.stop.message, { dispatchId: sub.id });
     else notify("dispatch", `主 agent 本轮${sub.stop.error ? "以原生错误结束" : "没有最终消息"}（dispatch ${sub.id}）`);
+    setImmediate(pumpSpeech);
     const task = item.type === "worker.turn_ended" && S.tasks[item.taskId];
     if (task && task.state === "reviewing" && task.latestResultEventId === item.eventId) {
       notify("task", `${task.title}：结果尚未归类（主助手本轮没有调用 tasks.decide），任务保持 reviewing`, { taskId: task.taskId });
@@ -867,6 +887,128 @@ async function scheduleMain() {
   }
 }
 
+// ---------- 语音：音频子进程与播报队列 ----------
+
+let audio = null; // { proc, ready, input, speaking }
+const FINAL_SPEECH = new Set(["played", "interrupted", "failed", "unknown", "stale"]);
+
+// 本轮通过 ask_user 打开的问题；播报前要核对它仍然开放。
+function requestOpenedBy(dispatchId) {
+  const op = Object.values(S.ops).find((o) => o.dispatchId === dispatchId && o.action === "tasks.decide" && o.result.task?.openRequest);
+  return op ? op.result.task.openRequest.requestId : null;
+}
+
+function enqueueSpeech(text, dispatchId) {
+  if (!config.voice) return;
+  const sp = { speechId: randomUUID(), dispatchId, requestId: dispatchId ? requestOpenedBy(dispatchId) : null, text, state: "ready", createdAt: now() };
+  S.speech[sp.speechId] = sp;
+  save("speech", sp.speechId, sp);
+}
+
+// 只去掉残留的 Markdown 标记，不改写或删减文字。
+const speakable = (text) => text.replace(/```[a-z]*|`|\*\*|__|^#+\s*|^>\s*|^\s*[-*]\s+/gm, "");
+
+function pumpSpeech() {
+  if (!audio?.ready || audio.speaking) return;
+  const next = Object.values(S.speech).filter((s) => s.state === "ready").sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+  if (!next) return;
+  if (next.requestId && S.requests[next.requestId]?.state !== "open") {
+    next.state = "stale";
+    save("speech", next.speechId, next);
+    commit();
+    notify("voice", "相关问题已回答或撤回，跳过一条过时的播报");
+    return pumpSpeech();
+  }
+  next.state = "sent";
+  save("speech", next.speechId, next);
+  commit();
+  audio.speaking = next.speechId;
+  audio.proc.stdin.write(JSON.stringify({ cmd: "speak", speechId: next.speechId, text: speakable(next.text) }) + "\n");
+}
+
+function setSpeechState(speechId, state, message) {
+  const sp = S.speech[speechId];
+  if (!sp) return;
+  sp.state = state;
+  if (state === "playing") sp.startedAt = now(); // 与 createdAt 之差即"回复就绪→开始播放"耗时
+  save("speech", speechId, sp);
+  commit();
+  if (state === "failed") notify("voice", `播报失败：${message}；文字已显示，可用 /replay 重播`);
+  if (FINAL_SPEECH.has(state) && audio?.speaking === speechId) {
+    audio.speaking = null;
+    setImmediate(pumpSpeech);
+  }
+}
+
+const REJECT_REASONS = { no_speech: "没有听到说话", too_long: "这句话太长了，请分句再说", empty: "没有识别出内容，请重说或用文字输入" };
+
+function onAudioEvent(ev) {
+  switch (ev.event) {
+    case "ready":
+      audio.ready = true;
+      audio.input = ev.input;
+      notify("voice", `语音就绪：输入 ${ev.input ?? "无（不能唤醒和录音）"}，输出 ${ev.output}，唤醒短语「${ev.wakePhrase}」`);
+      pumpSpeech();
+      break;
+    case "error":
+      notify("voice", `音频错误（${ev.code}）：${ev.message}`);
+      break;
+    case "wake":
+      notify("voice", "已唤醒，请说话");
+      break;
+    case "state":
+      if (ev.state === "listening") notify("voice", "正在听…");
+      break;
+    case "utterance_rejected":
+      notify("voice", REJECT_REASONS[ev.reason] ?? ev.reason);
+      break;
+    case "transcript": {
+      const item = enqueueItem({ type: "user.message", text: ev.text, source: "voice" });
+      commit();
+      notify("heard", ev.text, { messageId: item.id, audioMs: ev.audioMs, asrMs: ev.asrMs });
+      setImmediate(scheduleMain);
+      break;
+    }
+    case "speech":
+      if (ev.state === "playing") setSpeechState(ev.speechId, "playing");
+      else setSpeechState(ev.speechId, ev.state, ev.message);
+      break;
+    default:
+      notify("diag", `未知音频事件：${JSON.stringify(ev)}`);
+  }
+}
+
+function startAudio() {
+  const python = path.join(ROOT, "audio", ".venv", "bin", "python");
+  if (!existsSync(python)) throw new Error(`缺少音频环境 ${python}；按 audio/requirements.txt 创建虚拟环境`);
+  const proc = spawn(python, ["-I", path.join(ROOT, "audio", "voice.py"), JSON.stringify(config.voice)], { stdio: ["pipe", "pipe", "pipe"] });
+  audio = { proc, ready: false, input: null, speaking: null };
+  const stderrTail = [];
+  readline.createInterface({ input: proc.stdout }).on("line", (line) => {
+    try {
+      onAudioEvent(JSON.parse(line));
+    } catch (e) {
+      fatal(e);
+    }
+  });
+  readline.createInterface({ input: proc.stderr }).on("line", (line) => {
+    stderrTail.push(line);
+    if (stderrTail.length > 20) stderrTail.shift();
+  });
+  proc.on("exit", (code, signal) => {
+    const speaking = audio?.speaking;
+    audio = null;
+    if (speaking) setSpeechState(speaking, "unknown");
+    notify("voice", `音频进程已退出（${signal ?? code}），语音不可用，文字控制台仍可使用${stderrTail.length ? `\n${stderrTail.join("\n")}` : ""}`);
+  });
+}
+
+function needAudio() {
+  if (!config.voice) throw new ToolError("voice_disabled", "配置中没有 voice 段，只能用文字");
+  if (!audio?.ready) throw new ToolError("voice_unavailable", "音频进程未就绪");
+  return audio;
+}
+
 // ---------- 主 agent 工具 ----------
 
 const SIDE_EFFECT_ACTIONS = new Set(["agents.start", "agents.release", "agents.pause", "agents.resume", "tasks.submit", "tasks.send", "tasks.decide", "tasks.reply", "tasks.cancel"]);
@@ -1151,8 +1293,30 @@ const CONSOLE = {
     return { messageId: item.id, position };
   },
 
+  async "voice.listen"() {
+    needAudio().proc.stdin.write(JSON.stringify({ cmd: "listen" }) + "\n");
+    return { listening: true };
+  },
+
+  // 停止播放由 daemon 直接处理，不经过主 agent，也不影响任务。
+  async "voice.stop"() {
+    needAudio().proc.stdin.write(JSON.stringify({ cmd: "stop_playback" }) + "\n");
+    return { stopped: true };
+  },
+
+  async "speech.replay"() {
+    needAudio();
+    const last = Object.values(S.speech).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    if (!last) throw new ToolError("not_found", "还没有可重播的内容");
+    enqueueSpeech(last.text, null);
+    commit();
+    pumpSpeech();
+    return { replaying: last.text };
+  },
+
   async status() {
     return {
+      voice: config.voice ? (audio ? { ready: audio.ready, input: audio.input, speaking: audio.speaking } : "unavailable") : "disabled",
       agents: Object.values(S.agents).filter((a) => !a.released && a.activity !== "exited").map(agentView),
       tasks: Object.values(S.tasks).filter((t) => !TERMINAL_STATES.has(t.state)).map(taskView),
       queued: Object.values(S.inbox).filter((i) => i.status === "queued").length,
@@ -1322,6 +1486,8 @@ async function daemonCommand(flags) {
     consumeSpool();
     watch(SPOOL_DIR, () => { try { consumeSpool(); } catch (e) { fatal(e); } });
     setInterval(() => { try { consumeSpool(); } catch (e) { fatal(e); } }, 500);
+    if (config.voice) startAudio();
+    else notify("voice", "配置中没有 voice 段，只使用文字控制台");
     await ensureMain(flags.includes("--new-main"));
     setInterval(pollAll, POLL_MS);
     notify("daemon", `就绪；用 \`node ${path.relative(process.cwd(), SCRIPT) || SCRIPT} listen\` 打开控制台`);
@@ -1333,8 +1499,10 @@ async function daemonCommand(flags) {
 
 // ---------- 控制台 ----------
 
-const HELP = `输入文字直接发给主助手。命令：
-  /status                         查看 agent、未结束任务和排队情况
+const HELP = `输入文字直接发给主助手；直接回车开始录一句话（会先停止正在播放的内容）。命令：
+  /stop                           停止当前播放（不影响任务）
+  /replay                         重播最近一条回复
+  /status                         查看语音、agent、未结束任务和排队情况
   /cancel <taskId>                取消任务
   /resolve <taskId> cancelled|failed   确认 uncertain 任务的结局
   /dispatch <dispatchId> handled|resubmit   处理投递结果不明的 dispatch
@@ -1356,7 +1524,7 @@ async function listenCommand() {
       const msg = JSON.parse(buf.slice(0, nl));
       buf = buf.slice(nl + 1);
       if (msg.rpcId === "watch") continue;
-      const prefix = msg.type === "reply" ? "主助手" : msg.type;
+      const prefix = { reply: "主助手", heard: "你说", voice: "语音" }[msg.type] ?? msg.type;
       process.stdout.write(`\n[${msg.at.slice(11, 19)}] ${prefix}：${msg.text}\n> `);
     }
   });
@@ -1365,11 +1533,13 @@ async function listenCommand() {
   const rl = readline.createInterface({ input: process.stdin });
   for await (const raw of rl) {
     const line = raw.trim();
-    if (!line) { process.stdout.write("> "); continue; }
     const [cmd, a, b] = line.split(/\s+/);
     let res;
     try {
-      if (cmd === "/quit") process.exit(0);
+      if (!line) res = await rpc("voice.listen", {});
+      else if (cmd === "/quit") process.exit(0);
+      else if (cmd === "/stop") res = await rpc("voice.stop", {});
+      else if (cmd === "/replay") res = await rpc("speech.replay", {});
       else if (cmd === "/status") res = await rpc("status", {});
       else if (cmd === "/cancel") res = await rpc("task.cancel", { taskId: a });
       else if (cmd === "/resolve") res = await rpc("task.resolve", { taskId: a, to: b });
