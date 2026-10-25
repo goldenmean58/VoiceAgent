@@ -1037,7 +1037,7 @@ async function scheduleMain() {
 // Herdr 后台服务里的进程弹麦克风授权，只有从有权限的终端 App 启动才能录音。
 let audio = null; // { sock, ready, input, speaking }
 const sendAudio = (cmd) => audio.sock.write(JSON.stringify(cmd) + "\n");
-const FINAL_SPEECH = new Set(["played", "interrupted", "failed", "unknown", "stale"]);
+const FINAL_SPEECH = new Set(["played", "interrupted", "failed", "unknown", "stale", "skipped"]);
 
 // 本轮通过 ask_user 打开的问题；播报前要核对它仍然开放。
 function requestOpenedBy(dispatchId) {
@@ -1100,9 +1100,22 @@ function onAudioEvent(ev) {
     case "error":
       notify("voice", `音频错误（${ev.code}）：${ev.message}`);
       break;
-    case "wake":
-      notify("voice", "已唤醒，请说话");
+    case "wake": {
+      // 播报中唤醒即打断：音频进程已停止当前播放并清空其队列，这里丢弃尚未下发的普通回复，录音结束后不再接着播旧内容。
+      // 关联 ask_user 问题的播报保留，录音结束后照常播放（播放前仍会核对问题是否开放）。
+      if (!audio.speaking) {
+        notify("voice", "已唤醒，请说话");
+        break;
+      }
+      const pending = Object.values(S.speech).filter((s) => s.state === "ready" && !s.requestId);
+      for (const sp of pending) {
+        sp.state = "skipped";
+        save("speech", sp.speechId, sp);
+      }
+      if (pending.length) commit();
+      notify("voice", `已唤醒，停止播报${pending.length ? `并跳过 ${pending.length} 条待播内容（文字已显示）` : ""}，请说话`);
       break;
+    }
     case "state":
       if (ev.state === "listening") notify("voice", "正在听…");
       break;

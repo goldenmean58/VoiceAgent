@@ -4,6 +4,7 @@
 输入命令：listen、speak、stop_playback、shutdown；输出事件见 emit 调用处。
 """
 import json
+import math
 import os
 import queue
 import re
@@ -56,10 +57,11 @@ def load_models(cfg):
         fail("wake_phrase_mismatch", f"keywords 文件中没有唤醒短语「{cfg['wakePhrase']}」，现有：{phrases}")
 
     k, a, t = m["kws"], m["asr"], m["tts"]
-    kws = sherpa_onnx.KeywordSpotter(
+    # 两个实例：一个检测麦克风，一个在合成线程里扫描待播音频，不跨线程共用。
+    kws, echo_kws = (sherpa_onnx.KeywordSpotter(
         tokens=k["tokens"], encoder=k["encoder"], decoder=k["decoder"], joiner=k["joiner"],
         keywords_file=k["keywordsFile"], num_threads=k["numThreads"], provider="cpu",
-    )
+    ) for _ in range(2))
     asr = sherpa_onnx.OfflineRecognizer.from_sense_voice(
         model=a["model"], tokens=a["tokens"], num_threads=a["numThreads"], use_itn=a["useItn"],
     )
@@ -77,7 +79,7 @@ def load_models(cfg):
     vad_cfg.silero_vad.min_silence_duration = cfg["endSilenceMs"] / 1000
     vad_cfg.silero_vad.max_speech_duration = cfg["maxUtteranceMs"] / 1000
     vad_cfg.sample_rate = SAMPLE_RATE
-    return kws, asr, tts, vad_cfg, t
+    return kws, echo_kws, asr, tts, vad_cfg, t
 
 
 SENTENCE_END = re.compile(r"(?<=[。！？!?；;\n])")
@@ -107,11 +109,28 @@ def wake_ack(tts, sid, text=WAKE_ACK_TEXT):
     return samples[max(voiced[0] - 3, 0) * frame: (voiced[-1] + 4) * frame], rate
 
 
-class Speaker:
-    """单次只播一条；按句流水线合成，播放当前句时合成下一句。"""
+def contains_wake(kws, samples, rate):
+    """离线扫描一段待播音频是否会触发唤醒词。"""
+    s = kws.create_stream()
+    s.accept_waveform(rate, samples)
+    s.accept_waveform(rate, np.zeros(rate // 2, dtype=np.float32))
+    s.input_finished()
+    while kws.is_ready(s):
+        kws.decode_stream(s)
+        if kws.get_result(s):
+            return True
+    return False
 
-    def __init__(self, tts, speaker_id, speed, guard_ms):
-        self.tts, self.sid, self.speed, self.guard = tts, speaker_id, speed, guard_ms / 1000
+
+class Speaker:
+    """单次只播一条；按句流水线合成，播放当前句时合成下一句。
+
+    播报期间照常检测唤醒词以便打断；合成后用 echo_kws 扫描每段音频，自身含唤醒词的段在播放期间及其后
+    保护窗口内暂停检测，避免外放的口播把自己唤醒。
+    """
+
+    def __init__(self, tts, echo_kws, speaker_id, speed, guard_ms):
+        self.tts, self.echo_kws, self.sid, self.speed, self.guard = tts, echo_kws, speaker_id, speed, guard_ms / 1000
         self.queue = queue.Queue()
         self.stop_requested = threading.Event()
         self.allowed = threading.Event()  # 录音期间清除：新回复暂存，录音结束后再播
@@ -133,7 +152,14 @@ class Speaker:
                 emit("speech", speechId=speech_id, state="failed", message=str(e))
             finally:
                 self.busy = False
-                self.guard_until = time.monotonic() + self.guard
+
+    def drop_queued(self):
+        while True:
+            try:
+                speech_id, _ = self.queue.get_nowait()
+            except queue.Empty:
+                return
+            emit("speech", speechId=speech_id, state="interrupted")
 
     def play(self, speech_id, text):
         sentences = [s.strip() for s in SENTENCE_END.split(text) if s.strip()] or [text]
@@ -144,11 +170,15 @@ class Speaker:
         produced = queue.Queue(maxsize=2)
 
         def produce():
+            tail = np.zeros(0, dtype=np.float32)  # 带上前一段结尾一起扫描，覆盖“你好，叮洛”这种被逗号切开的情况
             try:
                 for s in sentences:
                     if self.stop_requested.is_set():
                         break
-                    produced.put(synthesize(self.tts, s, self.sid, self.speed))
+                    samples, rate = synthesize(self.tts, s, self.sid, self.speed)
+                    has_wake = contains_wake(self.echo_kws, np.concatenate([tail, samples]), rate)
+                    tail = samples[-int(1.5 * rate):]
+                    produced.put((samples, rate, has_wake))
             except Exception as e:
                 produced.put(e)
             produced.put(None)
@@ -166,18 +196,25 @@ class Speaker:
                 break
             if isinstance(audio, Exception):
                 raise audio
-            sd.play(*audio)
+            samples, rate, has_wake = audio
+            if has_wake:
+                self.guard_until = math.inf
+            sd.play(samples, rate)
             if not started:
                 started = True
                 emit("speech", speechId=speech_id, state="playing")
-            while sd.get_stream().active:
-                if self.stop_requested.wait(0.05):
-                    sd.stop()
-                    return "interrupted"
+            try:
+                while sd.get_stream().active:
+                    if self.stop_requested.wait(0.05):
+                        sd.stop()
+                        return "interrupted"
+            finally:
+                if has_wake:
+                    self.guard_until = time.monotonic() + self.guard
         return "played"
 
     def in_guard(self):
-        return self.busy or time.monotonic() < self.guard_until
+        return time.monotonic() < self.guard_until
 
 
 class Recording:
@@ -214,8 +251,8 @@ class Recording:
 
 def main():
     cfg = json.loads(sys.argv[1])
-    kws, asr, tts, vad_cfg, tts_params = load_models(cfg)
-    speaker = Speaker(tts, tts_params["speakerId"], cfg["ttsSpeed"], cfg["playbackGuardMs"])
+    kws, echo_kws, asr, tts, vad_cfg, tts_params = load_models(cfg)
+    speaker = Speaker(tts, echo_kws, tts_params["speakerId"], cfg["ttsSpeed"], cfg["playbackGuardMs"])
     try:
         ack = wake_ack(tts, tts_params["speakerId"])
         heard = wake_ack(tts, tts_params["speakerId"], HEARD_ACK_TEXT)
@@ -303,7 +340,7 @@ def main():
             continue
 
         if state == "armed":
-            # 半双工：播报及保护窗口内不检测唤醒词，避免把自己的口播当成指令。
+            # 播报期间也检测唤醒词，用于打断；只在自身含唤醒词的口播段和应答“收到”的保护窗口内暂停。
             if speaker.in_guard():
                 kws_stream = None
                 continue
@@ -314,7 +351,8 @@ def main():
                 kws.decode_stream(kws_stream)
                 if kws.get_result(kws_stream):
                     kws.reset_stream(kws_stream)
-                    emit("wake")
+                    emit("wake")  # 先于 interrupted 送达，daemon 据此丢弃尚未下发的播报
+                    speaker.drop_queued()
                     start_listening()
                     break
         elif state == "listening":
