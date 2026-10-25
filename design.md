@@ -742,7 +742,7 @@ Claude 主 agent 额外传 `--tools Bash --strict-mcp-config`：主 agent 只用
 - 一次完整往返共 7 次调用、上下文合计约 9.5 万 token，原来是每次调用重读 6 万到 8 万。往返包括启动 worker、投递、读结果、判断和两次口播，审核结论与实际结果一致。
 - 发现两个问题：
   - 主 agent 曾把 `agents.list` 里的自己当成工作 agent 汇报。现在 `agents.list` 只返回 `workers`（不含主 agent）和 `candidates`。
-  - 用户只给了项目名、没给路径时，主 agent 自己用 `ls`/`find` 搜索了用户目录。这违反了"主 agent 不运行项目命令"的约定，目前只靠提示词约束。
+  - 用户只给了项目名、没给路径时，主 agent 自己用 `ls`/`find` 搜索了用户目录。经用户确认，取消"主 agent 不运行命令"的约定：查路径、看文件这类简单查询允许主 agent 自己做，改代码和较长的工作仍委派给工作 agent；主 agent 仍不直接调用 herdr。
 
 配置缺失/非法即报告字段错误，不默选其他模型、项目或后端。项目路径先 realpath 再判断是否位于 allowedRoots 中。maxManaged 在第一版只能为 1，不能通过改配置宣称多 worker 已被支持。
 
