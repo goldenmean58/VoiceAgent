@@ -650,15 +650,16 @@ SenseVoice 与 Kokoro 的选型参考官方模型文档；实现前固定兼容�
 里程碑 C 的实际选型（2026-10-25 经用户确认）：
 
 - Python 包装在项目内的 uv 虚拟环境 `audio/.venv`（Python 3.14），版本锁定在 `audio/requirements.txt`：sherpa-onnx 1.13.8、sounddevice 0.5.6、numpy 2.5.4。
-- 模型全部用 int8 版本，放在 `~/.local/share/voice-assistant/models`，压缩包的 sha256 记录在 `SHA256SUMS` 和模型清单中：
+- 合成模型用 fp32 版本，其余模型用 int8 版本，放在 `~/.local/share/voice-assistant/models`，压缩包的 sha256 记录在 `SHA256SUMS` 和模型清单中：
   - 唤醒：kws-zipformer-wenetspeech-3.3M
   - 端点检测：silero_vad.onnx
   - 识别：sense-voice-zh-en-ja-ko-yue-int8-2025-09-09
-  - 合成：kokoro-int8-multi-lang-v1_1，音色 sid 12（最初选 sid 3 / zf_001，因短句 NaN 问题更换，见下文）
+  - 合成：kokoro-multi-lang-v1_1（fp32，最初用 kokoro-int8-multi-lang-v1_1，因短句 NaN 和速度更换，见下文），音色 sid 12（最初选 sid 3 / zf_001，因 int8 短句 NaN 问题更换）
 - 模型清单在 `~/.config/voice-assistant/models/manifest.json`，记录模型路径、哈希和选定参数；播报语速不在清单里，由 config.json 的 voice.ttsSpeed 配置，daemon 校验后随 voice 段下发给音频进程。keywords 文件按 ppinyin 规则手写，逐个 token 核对过它们都在模型词表中，没有引入 text2token 需要的额外依赖。音频进程启动时核对唤醒短语与 keywords 文件一致。
 - 播报按句流水线合成：播放当前句时合成下一句；首句较长且逗号前至少 4 个字时，先在第一个逗号处切开。实测 149 字的回复从就绪到开始播放约 1.6 秒，`/stop` 约 0.2 秒生效。
 - 实测 kokoro int8 合成一两个字的短句时，部分音色会输出全 NaN，播放时没有声音。sid 3 上“好的”“我在”“收到。”几乎每次都是 NaN；扫描 sid 3–57 后，12、15、18、24、29、31、32、35、37、38、40–53、56 在 20 条常见短回复上没有出现 NaN，但单字句（如“嗯。”“对。”）在其他一些音色上仍会出现。因此合成结果含 NaN 时按合成失败报告，不记为 played。
-- 唤醒应答：音频进程启动时用当前音色以固定 1.3 倍语速合成一次“我在”（不随 ttsSpeed：sid 12、4 线程下实测应答为 1.95 倍时“我在”38/40、“收到”31/40 输出 NaN，1.3/1.5/1.7 倍各 40 次均无；numThreads 为 1 时即使 1.0 倍也几乎每次 NaN），裁掉首尾静音后留在内存，之后每次唤醒或按键录音直接播放，不再现场合成。合成失败（含 NaN）时音频进程启动失败，并提示更换 speakerId。实测从收到录音请求到开始录音约 0.79 秒（sid 12），主要是这两个字本身的播放时长。应答播放期间的采集被丢弃，用户需在“我在”之后再开口。
+- 改用 fp32 后（同一 Kokoro v1.1，voices.bin、tokens.txt、词典与 int8 包一致，模型 325 MB 对 114 MB），M4、4 线程实测：7 条短句各 3 次，在 sid 3 / 12、1.0 / 1.2 / 1.95 倍下均未出现 NaN（int8 下 sid 12 在 1.95 倍为 18/21、sid 3 在 1.0 倍为 18/21）；6 条中英混合句 RTF 约 0.38–0.50，int8 约 0.63–0.72。NaN 检查保留。
+- 唤醒应答：音频进程启动时用当前音色以固定 1.3 倍语速合成一次“我在”（不随 ttsSpeed：int8 时期 sid 12、4 线程下实测应答为 1.95 倍时“我在”38/40、“收到”31/40 输出 NaN，1.3/1.5/1.7 倍各 40 次均无；numThreads 为 1 时即使 1.0 倍也几乎每次 NaN），裁掉首尾静音后留在内存，之后每次唤醒或按键录音直接播放，不再现场合成。合成失败（含 NaN）时音频进程启动失败，并提示更换 speakerId。实测从收到录音请求到开始录音约 0.79 秒（sid 12），主要是这两个字本身的播放时长。应答播放期间的采集被丢弃，用户需在“我在”之后再开口。
 - 收到应答：同样在启动时缓存一段“收到”。VAD 判定一句话结束后立即非阻塞播放，与语音识别并行；播放期间及其后 playbackGuardMs 内不检测唤醒词，回到待唤醒前等它播完，避免被录音期间暂存的回复截断。
 
 ### 11.2 名称与唤醒短语

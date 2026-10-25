@@ -95,7 +95,7 @@ B=https://github.com/k2-fsa/sherpa-onnx/releases/download
 curl -LO $B/kws-models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2
 curl -LO $B/asr-models/silero_vad.onnx
 curl -LO $B/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2
-curl -LO $B/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2
+curl -LO $B/tts-models/kokoro-multi-lang-v1_1.tar.bz2
 ```
 
 然后准备两个文件：
@@ -203,8 +203,8 @@ design.md           设计文档与验收记录
 
 ## 已知问题
 
-- kokoro int8 合成一两个字的短句时，部分音色会输出全 NaN，播出来没有声音。
-  - 已改为把这种情况报告为合成失败，不再算作"已播放"；
-  - sid 12 在常见短回复上没有出现，sid 3 几乎每次都出现。
+- kokoro int8 合成一两个字的短句时，部分音色会输出全 NaN，播出来没有声音（sid 3 几乎每次都出现）。
+  - 因此改用 fp32 版（`kokoro-multi-lang-v1_1`）：本机实测没有再出现 NaN，合成也更快；
+  - 合成结果含 NaN 时仍报告为合成失败，不算作"已播放"。
 - SenseVoice 偶尔把"叮洛"识别成"丁落"。
 - 播报中说唤醒词可以打断（也可以在控制台按回车或 `/stop`）。没有回声消除：外放音量大、用户声音不比外放回声高约 6dB 时可能唤不醒；口播内容本身含唤醒词（或同音词）的那一段播放期间不检测唤醒词。
