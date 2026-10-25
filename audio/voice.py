@@ -80,6 +80,28 @@ def load_models(cfg):
 
 
 SENTENCE_END = re.compile(r"(?<=[。！？!?；;\n])")
+WAKE_ACK_TEXT = "我在"
+WAKE_ACK_SPEEDUP = 1.3  # 应答越短，用户越早能开口
+
+
+def synthesize(tts, text, sid, speed):
+    audio = tts.generate(text, sid=sid, speed=speed)
+    samples = np.asarray(audio.samples, dtype=np.float32)
+    if len(samples) == 0:
+        raise RuntimeError(f"合成结果为空：{text}")
+    # 实测 kokoro int8 对一两个字的短句在部分音色上会输出全 NaN，播放时没有声音。
+    if np.isnan(samples).any():
+        raise RuntimeError(f"合成结果含 NaN（音色 {sid}）：{text}")
+    return samples, audio.sample_rate
+
+
+def wake_ack(tts, sid, speed):
+    """启动时合成一次唤醒应答并裁掉首尾静音，之后每次唤醒直接播放。"""
+    samples, rate = synthesize(tts, WAKE_ACK_TEXT, sid, speed * WAKE_ACK_SPEEDUP)
+    frame = int(0.01 * rate)
+    rms = np.sqrt(np.mean(samples[: len(samples) // frame * frame].reshape(-1, frame) ** 2, axis=1))
+    voiced = np.nonzero(rms > 0.1 * rms.max())[0]
+    return samples[max(voiced[0] - 3, 0) * frame: (voiced[-1] + 4) * frame], rate
 
 
 class Speaker:
@@ -114,7 +136,7 @@ class Speaker:
         sentences = [s.strip() for s in SENTENCE_END.split(text) if s.strip()] or [text]
         # 首句较长时先在第一个逗号处切开，缩短开口前的合成等待。
         first, sep, rest = sentences[0].partition("，")
-        if sep and rest and len(sentences[0]) > 16:
+        if sep and rest and len(sentences[0]) > 16 and len(first) >= 4:
             sentences[0:1] = [first + sep, rest]
         produced = queue.Queue(maxsize=2)
 
@@ -123,10 +145,7 @@ class Speaker:
                 for s in sentences:
                     if self.stop_requested.is_set():
                         break
-                    audio = self.tts.generate(s, sid=self.sid, speed=self.speed)
-                    if len(audio.samples) == 0:
-                        raise RuntimeError(f"合成结果为空：{s}")
-                    produced.put(audio)
+                    produced.put(synthesize(self.tts, s, self.sid, self.speed))
             except Exception as e:
                 produced.put(e)
             produced.put(None)
@@ -144,7 +163,7 @@ class Speaker:
                 break
             if isinstance(audio, Exception):
                 raise audio
-            sd.play(np.asarray(audio.samples, dtype=np.float32), audio.sample_rate)
+            sd.play(*audio)
             if not started:
                 started = True
                 emit("speech", speechId=speech_id, state="playing")
@@ -190,16 +209,14 @@ class Recording:
         return None
 
 
-def beep():
-    t = np.arange(int(0.12 * 24000)) / 24000
-    sd.play((0.2 * np.sin(2 * np.pi * 880 * t)).astype(np.float32), 24000)
-    sd.wait()
-
-
 def main():
     cfg = json.loads(sys.argv[1])
     kws, asr, tts, vad_cfg, tts_params = load_models(cfg)
     speaker = Speaker(tts, tts_params["speakerId"], tts_params["speed"], cfg["playbackGuardMs"])
+    try:
+        ack = wake_ack(tts, tts_params["speakerId"], tts_params["speed"])
+    except RuntimeError as e:
+        fail("wake_ack_failed", f"唤醒应答合成失败，请换一个 speakerId：{e}")
 
     commands = queue.Queue()
 
@@ -238,8 +255,9 @@ def main():
         speaker.stop_requested.set()
         while speaker.busy:
             time.sleep(0.02)
-        beep()
-        while not chunks.empty():  # 丢弃提示音期间的采集
+        sd.play(*ack)
+        sd.wait()
+        while not chunks.empty():  # 丢弃应答播放期间的采集
             chunks.get_nowait()
         recording = Recording(vad_cfg, cfg["waitForSpeechMs"], cfg["maxUtteranceMs"])
         state = "listening"

@@ -654,9 +654,11 @@ SenseVoice 与 Kokoro 的选型参考官方模型文档；实现前固定兼容�
   - 唤醒：kws-zipformer-wenetspeech-3.3M
   - 端点检测：silero_vad.onnx
   - 识别：sense-voice-zh-en-ja-ko-yue-int8-2025-09-09
-  - 合成：kokoro-int8-multi-lang-v1_1，音色 sid 3（zf_001）
+  - 合成：kokoro-int8-multi-lang-v1_1，音色 sid 12（最初选 sid 3 / zf_001，因短句 NaN 问题更换，见下文）
 - 模型清单在 `~/.config/voice-assistant/models/manifest.json`，记录模型路径、哈希和选定参数。keywords 文件按 ppinyin 规则手写，逐个 token 核对过它们都在模型词表中，没有引入 text2token 需要的额外依赖。音频进程启动时核对唤醒短语与 keywords 文件一致。
-- 播报按句流水线合成：播放当前句时合成下一句；首句较长时先在第一个逗号处切开。实测 149 字的回复从就绪到开始播放约 1.6 秒，`/stop` 约 0.2 秒生效。
+- 播报按句流水线合成：播放当前句时合成下一句；首句较长且逗号前至少 4 个字时，先在第一个逗号处切开。实测 149 字的回复从就绪到开始播放约 1.6 秒，`/stop` 约 0.2 秒生效。
+- 实测 kokoro int8 合成一两个字的短句时，部分音色会输出全 NaN，播放时没有声音。sid 3 上“好的”“我在”“收到。”几乎每次都是 NaN；扫描 sid 3–57 后，12、15、18、24、29、31、32、35、37、38、40–53、56 在 20 条常见短回复上没有出现 NaN，但单字句（如“嗯。”“对。”）在其他一些音色上仍会出现。因此合成结果含 NaN 时按合成失败报告，不记为 played。
+- 唤醒应答：音频进程启动时用当前音色以 1.3 倍语速合成一次“我在”，裁掉首尾静音后留在内存，之后每次唤醒或按键录音直接播放，不再现场合成。合成失败（含 NaN）时音频进程启动失败，并提示更换 speakerId。实测从收到录音请求到开始录音约 0.79 秒（sid 12），主要是这两个字本身的播放时长。应答播放期间的采集被丢弃，用户需在“我在”之后再开口。
 
 ### 11.2 名称与唤醒短语
 
@@ -668,7 +670,7 @@ SenseVoice 与 Kokoro 的选型参考官方模型文档；实现前固定兼容�
 
 ```text
 armed：持续本地检测唤醒词
-  → listening：提示音后录制一句话，VAD 判断话语结束
+  → listening：播放应答“我在”后录制一句话，VAD 判断话语结束
   → transcribing：生成最终文本
   → armed：文本已交 daemon，继续接受下一次唤醒
 
@@ -688,7 +690,7 @@ speaking + 按键录音：停止播放 → listening
 
 ### 11.5 录音边界与错误
 
-设计初值为等待开口 5 秒、句末静音 800ms、单次最长录音 30 秒，均为本应用参数，不冒充模型 API 默认值。空转写不发送；达到最长时提示重新分句，不把截断内容直接当完整指令执行。
+设计初值为等待开口 5 秒、句末静音 800ms（用户试用后改为 1200ms，留出思考停顿）、单次最长录音 30 秒，均为本应用参数，不冒充模型 API 默认值。空转写不发送；达到最长时提示重新分句，不把截断内容直接当完整指令执行。
 
 STT 出错显示具体错误并保留可重新录音入口；不自动发送不完整转写。控制台支持文字输入，使不确定的人名、路径或代码参数可以由用户明确输入。
 
@@ -716,7 +718,7 @@ daemon 对外提供本用户可访问的 Unix socket，运行目录权限 0700�
 {
   "schemaVersion": 1,
   "backend": "herdr",
-  "main": { "kind": "codex" },
+  "main": { "kind": "claude", "model": "sonnet", "effort": "medium" },
   "worker": { "defaultKind": "codex", "maxManaged": 1, "maxAutoContinue": 3 },
   "projects": { "allowedRoots": ["/absolute/path/to/project"] },
   "voice": {
@@ -725,11 +727,22 @@ daemon 对外提供本用户可访问的 Unix socket，运行目录权限 0700�
     "modelManifest": "/absolute/path/to/models/manifest.json",
     "playbackGuardMs": 300,
     "waitForSpeechMs": 5000,
-    "endSilenceMs": 800,
+    "endSilenceMs": 1200,
     "maxUtteranceMs": 30000
   }
 }
 ```
+
+`main.model` 与 `main.effort` 可省略，省略时沿用原生 CLI 的默认值。Claude 主 agent 传 `--model` / `--effort`（low/medium/high/xhigh/max）；Codex 主 agent 传 `-m` 和 `-c model_reasoning_effort=…`（minimal/low/medium/high/xhigh）。主 agent 只负责理解、派发、审核和总结，推荐 Sonnet + medium。测试数据显示主 agent 的消耗几乎全在每次调用重读上下文：两个主会话 97 次调用共读约 630 万 token，输出含思考约 2.2 万 token。因此思考强度主要影响延迟，不是成本。
+
+Claude 主 agent 额外传 `--tools Bash --strict-mcp-config`：主 agent 只用 Bash 调用工具命令，不需要其他内置工具和用户配置的 MCP 工具。用 `claude -p` 实测只回复一句话时的上下文：默认 31,606 token；只留 Bash 时 20,574 token（剩余的主要是 MCP 工具定义）；再加 `--strict-mcp-config` 后 7,427 token。
+
+实测 Sonnet + medium 主 agent（交互模式）：
+- 首次调用的上下文为 9,125 token，原来是约 5.1 万。
+- 一次完整往返共 7 次调用、上下文合计约 9.5 万 token，原来是每次调用重读 6 万到 8 万。往返包括启动 worker、投递、读结果、判断和两次口播，审核结论与实际结果一致。
+- 发现两个问题：
+  - 主 agent 曾把 `agents.list` 里的自己当成工作 agent 汇报。现在 `agents.list` 只返回 `workers`（不含主 agent）和 `candidates`。
+  - 用户只给了项目名、没给路径时，主 agent 自己用 `ls`/`find` 搜索了用户目录。这违反了"主 agent 不运行项目命令"的约定，目前只靠提示词约束。
 
 配置缺失/非法即报告字段错误，不默选其他模型、项目或后端。项目路径先 realpath 再判断是否位于 allowedRoots 中。maxManaged 在第一版只能为 1，不能通过改配置宣称多 worker 已被支持。
 

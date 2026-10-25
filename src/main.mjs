@@ -84,6 +84,12 @@ function loadConfig() {
   if (c.schemaVersion !== 1) errs.push("schemaVersion 必须为 1");
   if (c.backend !== "herdr") errs.push('backend 必须为 "herdr"');
   if (!KINDS.includes(c.main?.kind)) errs.push("main.kind 必须为 claude 或 codex");
+  // main.model / main.effort 可省略：省略时沿用 CLI 自己的默认值。
+  if (c.main?.model !== undefined && (typeof c.main.model !== "string" || !c.main.model)) errs.push("main.model 必须为非空字符串");
+  if (c.main?.effort !== undefined) {
+    const levels = c.main.kind === "claude" ? ["low", "medium", "high", "xhigh", "max"] : ["minimal", "low", "medium", "high", "xhigh"];
+    if (!levels.includes(c.main.effort)) errs.push(`main.effort 必须为 ${levels.join("/")} 之一`);
+  }
   if (!KINDS.includes(c.worker?.defaultKind)) errs.push("worker.defaultKind 必须为 claude 或 codex");
   if (c.worker?.maxManaged !== 1) errs.push("worker.maxManaged 第一版只能为 1");
   if (!Number.isInteger(c.worker?.maxAutoContinue) || c.worker.maxAutoContinue < 0) errs.push("worker.maxAutoContinue 必须为非负整数");
@@ -331,6 +337,10 @@ function launchArgs(role, kind, agentId, nativeSessionId) {
       const promptFile = path.join(LAUNCH_DIR, `${agentId}-prompt.md`);
       writeFileAtomic(promptFile, renderMainPrompt());
       args.push("--append-system-prompt-file", promptFile);
+      // 主 agent 只通过 Bash 调用工具命令；去掉其余内置工具和用户的 MCP 工具，实测固定上下文可减少约四分之三。
+      args.push("--tools", "Bash", "--strict-mcp-config");
+      if (config.main.model) args.push("--model", config.main.model);
+      if (config.main.effort) args.push("--effort", config.main.effort);
     }
     return args;
   }
@@ -338,7 +348,11 @@ function launchArgs(role, kind, agentId, nativeSessionId) {
   for (const e of HOOK_EVENTS.codex) {
     args.push("-c", `hooks.${e}=[{hooks=[{type="command",command=${JSON.stringify(hookCommandLine("codex", e))}}]}]`);
   }
-  if (role === "main") args.push("-c", `developer_instructions=${JSON.stringify(renderMainPrompt())}`);
+  if (role === "main") {
+    args.push("-c", `developer_instructions=${JSON.stringify(renderMainPrompt())}`);
+    if (config.main.model) args.push("-m", config.main.model);
+    if (config.main.effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(config.main.effort)}`);
+  }
   return args;
 }
 
@@ -1210,7 +1224,9 @@ const TOOLS = {
   async "agents.list"() {
     const managedRefs = new Set(Object.values(S.agents).map((a) => a.backendRef));
     const candidates = (await herdr.discover()).filter((c) => !managedRefs.has(c.candidateRef));
-    return { managed: Object.values(S.agents).filter((a) => !a.released && a.activity !== "exited").map(agentView), candidates };
+    // 不列出主 agent 自己：实测 Sonnet 会把列表里的主 agent 当成工作 agent 汇报。
+    const workers = Object.values(S.agents).filter((a) => a.role === "worker" && !a.released && a.activity !== "exited");
+    return { workers: workers.map(agentView), candidates };
   },
 
   async "agents.start"({ kind = config.worker.defaultKind, cwd, name }) {

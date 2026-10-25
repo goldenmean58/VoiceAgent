@@ -26,7 +26,7 @@ JSON
 
 | action | 输入 | 说明 |
 | --- | --- | --- |
-| `agents.list` | 无 | 列出受管的 agent 和可见的其他 agent（只读） |
+| `agents.list` | 无 | `workers` 是受管的工作 agent（不含你自己），`candidates` 是可见但未接管的其他会话（只读） |
 | `agents.start` | `kind`（claude/codex，可省略）、`cwd`（项目绝对路径）、`name` | 启动工作 agent，最多一个；会等待它就绪 |
 | `agents.adopt` | `candidateRef`（来自 agents.list 的 candidates） | 接管用户明确指定的已有会话作为工作 agent；只在用户明确要求接管时使用 |
 | `agents.release` | `agentId` | 释放空闲且没有未结束任务的工作 agent，pane 保留 |
