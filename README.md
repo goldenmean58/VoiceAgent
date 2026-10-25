@@ -42,17 +42,17 @@
   "schemaVersion": 1,
   "backend": "herdr",
   "main": { "kind": "claude", "model": "sonnet", "effort": "medium" },
-  "worker": { "defaultKind": "claude", "maxManaged": 1, "maxAutoContinue": 3 },
+  "worker": { "defaultKind": "claude", "maxManaged": 5, "maxAutoContinue": 3 },
   "projects": { "allowedRoots": ["/absolute/path/to/your/projects"] },
   "voice": {
     "displayName": "叮洛",
     "wakePhrase": "你好叮洛",
     "modelManifest": "/Users/you/.config/voice-assistant/models/manifest.json",
     "playbackGuardMs": 300,
-    "ttsSpeed": 1.2,
+    "ttsSpeed": 1.4,
     "waitForSpeechMs": 5000,
-    "endSilenceMs": 1200,
-    "maxUtteranceMs": 30000
+    "endSilenceMs": 2000,
+    "maxUtteranceMs": 60000
   }
 }
 ```
@@ -65,8 +65,9 @@
 | `worker.maxAutoContinue` | 主 agent 连续让工作 agent"继续"的次数上限，用完后只能问你或给出结论 |
 | `projects.allowedRoots` | 工作 agent 只能在这些目录（含子目录）中启动或被接管 |
 | `voice` | 可省略；省略时只有文字控制台 |
-| `endSilenceMs` | 说话后静音多久算一句话结束 |
-| `ttsSpeed` | 播报语速倍数（正数），推荐 1.2；只影响回复播报，"我在""收到"两句应答固定按 1.3 倍合成 |
+| `endSilenceMs` | 说话后静音多久算一句话结束，推荐 2000，留出思考停顿；调大会让每句话说完后多等相应时长 |
+| `maxUtteranceMs` | 单句最长录音，推荐 60000；超长的整句会被拒绝，不会截断后执行 |
+| `ttsSpeed` | 播报语速倍数（正数），推荐 1.4；只影响回复播报，"我在""收到"两句应答固定按 1.3 倍合成 |
 
 配置缺失或非法时，daemon 会列出具体字段错误并拒绝启动，不会替你选一个默认值。
 
@@ -116,6 +117,50 @@ audio/.venv/bin/hf download mlx-community/whisper-large-v3-mlx config.json weigh
   ```
 
 - **模型清单** `~/.config/voice-assistant/models/manifest.json`：写明 `kws`、`vad`、`asr`、`tts` 各模型文件的绝对路径和参数，字段名与 `audio/voice.py` 中的 `load_models` 一致。ASR 填 `model`（上面的模型目录）、`language`（固定 `zh`，自动语言识别更慢且不更准）和 `initialPrompt`（推荐“以下是普通话与英语夹杂的语音，请使用简体中文，保留英语原文。”）。TTS 关键参数：`speakerId`（推荐 12，原因见"已知问题"）。语速不在清单里，由 `config.json` 的 `voice.ttsSpeed` 配置。
+
+  示例如下。把 `/Users/you` 换成你的用户目录：音频进程不展开 `~`，所以必须写绝对路径。`archives`、`sherpaOnnxVersion`、`mlxWhisperVersion` 和 `asr.source` 只用来记录模型的来源、版本和哈希，程序不会读取。
+
+  ```json
+  {
+    "schemaVersion": 1,
+    "sherpaOnnxVersion": "1.13.8",
+    "mlxWhisperVersion": "0.4.3",
+    "archives": {
+      "kokoro-multi-lang-v1_1.tar.bz2": "a3f4c73d043860e3fd2e5b06f36795eb81de0fc8e8de6df703245edddd87dbad",
+      "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2": "b2f7c89690dc8ce4c6ed6afeab7cd800c36ad1421fb6b6302b4a4b194cf7f35f",
+      "silero_vad.onnx": "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
+      "whisper-large-v3-mlx/weights.npz": "05ff791ce3630fae47e7c51004e9666204d786246ec07cac6110af768099b40d",
+      "whisper-large-v3-mlx/config.json": "34982ce6ae286095000f82ae9583b3431639e8b092bf60c961f203745e6500e3"
+    },
+    "kws": {
+      "tokens": "/Users/you/.local/share/voice-assistant/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/tokens.txt",
+      "encoder": "/Users/you/.local/share/voice-assistant/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+      "decoder": "/Users/you/.local/share/voice-assistant/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+      "joiner": "/Users/you/.local/share/voice-assistant/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+      "keywordsFile": "/Users/you/.config/voice-assistant/keywords.txt",
+      "numThreads": 1
+    },
+    "vad": {
+      "model": "/Users/you/.local/share/voice-assistant/models/silero_vad.onnx"
+    },
+    "asr": {
+      "source": "mlx-community/whisper-large-v3-mlx@49e6aa286ad60c14352c404340ded53710378a11",
+      "model": "/Users/you/.local/share/voice-assistant/models/whisper-large-v3-mlx",
+      "language": "zh",
+      "initialPrompt": "以下是普通话与英语夹杂的语音，请使用简体中文，保留英语原文。"
+    },
+    "tts": {
+      "model": "/Users/you/.local/share/voice-assistant/models/kokoro-multi-lang-v1_1/model.onnx",
+      "voices": "/Users/you/.local/share/voice-assistant/models/kokoro-multi-lang-v1_1/voices.bin",
+      "tokens": "/Users/you/.local/share/voice-assistant/models/kokoro-multi-lang-v1_1/tokens.txt",
+      "dataDir": "/Users/you/.local/share/voice-assistant/models/kokoro-multi-lang-v1_1/espeak-ng-data",
+      "lexicon": "/Users/you/.local/share/voice-assistant/models/kokoro-multi-lang-v1_1/lexicon-us-en.txt,/Users/you/.local/share/voice-assistant/models/kokoro-multi-lang-v1_1/lexicon-zh.txt",
+      "ruleFsts": "/Users/you/.local/share/voice-assistant/models/kokoro-multi-lang-v1_1/date-zh.fst,/Users/you/.local/share/voice-assistant/models/kokoro-multi-lang-v1_1/phone-zh.fst,/Users/you/.local/share/voice-assistant/models/kokoro-multi-lang-v1_1/number-zh.fst",
+      "numThreads": 4,
+      "speakerId": 12
+    }
+  }
+  ```
 
 音频进程启动时会检查清单里的文件是否存在，以及唤醒短语是否和 keywords 文件一致；缺什么就报什么，不会自动补。
 
@@ -214,8 +259,8 @@ design.md           设计文档与验收记录
 
 ## 已知问题
 
-- kokoro int8 合成一两个字的短句时，部分音色会输出全 NaN，播出来没有声音（sid 3 几乎每次都出现）。
-  - 因此改用 fp32 版（`kokoro-multi-lang-v1_1`）：本机实测没有再出现 NaN，合成也更快；
+- 合成用 fp32 版 Kokoro（`kokoro-multi-lang-v1_1`），本机实测没有出现 NaN。
+  - 没有用 int8 版：它合成一两个字的短句时，部分音色会输出全 NaN，播出来没有声音（sid 3 几乎每次都出现），而且合成更慢；
   - 合成结果含 NaN 时仍报告为合成失败，不算作"已播放"。
 - 识别用 Whisper large-v3，说完后约 1.2 秒出文字（M4，不含 VAD 的句末静音等待），常驻内存约 3.4 GB。英文技术词仍会听错（如 CI 听成"赛"、Claude 听成"Cluid"），合成语音上偶尔整句输出与内容无关的套话（如"本视频由……制作"）。裸 Whisper 对静音会凭空输出文字，所以只有 VAD 判定有语音的片段才送识别。
 - 播报中说唤醒词可以打断（也可以在控制台按回车或 `/stop`）。没有回声消除：外放音量大、用户声音不比外放回声高约 6dB 时可能唤不醒；口播内容本身含唤醒词（或同音词）的那一段播放期间不检测唤醒词。
