@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 
+import mlx_whisper
 import numpy as np
 import sherpa_onnx
 import sounddevice as sd
@@ -62,9 +63,8 @@ def load_models(cfg):
         tokens=k["tokens"], encoder=k["encoder"], decoder=k["decoder"], joiner=k["joiner"],
         keywords_file=k["keywordsFile"], num_threads=k["numThreads"], provider="cpu",
     ) for _ in range(2))
-    asr = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-        model=a["model"], tokens=a["tokens"], num_threads=a["numThreads"], use_itn=a["useItn"],
-    )
+    # mlx-whisper 首次调用才加载模型（约 2 秒），启动时用静音预热；结果丢弃，裸 Whisper 对静音会幻听。
+    transcribe(a, np.zeros(SAMPLE_RATE, dtype=np.float32))
     tts = sherpa_onnx.OfflineTts(sherpa_onnx.OfflineTtsConfig(
         model=sherpa_onnx.OfflineTtsModelConfig(
             kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
@@ -79,7 +79,7 @@ def load_models(cfg):
     vad_cfg.silero_vad.min_silence_duration = cfg["endSilenceMs"] / 1000
     vad_cfg.silero_vad.max_speech_duration = cfg["maxUtteranceMs"] / 1000
     vad_cfg.sample_rate = SAMPLE_RATE
-    return kws, echo_kws, asr, tts, vad_cfg, t
+    return kws, echo_kws, a, tts, vad_cfg, t
 
 
 # 句末和中文逗号、顿号、冒号处都切开分别合成：sherpa-onnx 内部按长度而非标点分批，混有英文时停顿会落错位置。
@@ -102,6 +102,14 @@ def strip_fillers(text):
     if ONLY_HM.fullmatch(text):
         return text
     return re.sub(r"\s{2,}", " ", LEAD_PUNCT.sub("", REPEAT.sub(r"\2", FILLER.sub("", text)))).strip()
+
+
+def transcribe(asr, samples):
+    # 固定语言、greedy：自动语言识别实测慢近一倍且不更准；mlx-whisper 不支持 beam search。
+    return mlx_whisper.transcribe(
+        samples, path_or_hf_repo=asr["model"], language=asr["language"], initial_prompt=asr["initialPrompt"],
+        temperature=0, condition_on_previous_text=False, verbose=None,
+    )["text"]
 
 
 def synthesize(tts, text, sid, speed):
@@ -379,11 +387,9 @@ def main():
                 speaker.guard_until = max(speaker.guard_until, time.monotonic() + len(heard[0]) / heard[1] + speaker.guard)
                 emit("state", state="transcribing")
                 t0 = time.monotonic()
-                s = asr.create_stream()
-                # 实测 SenseVoice 在没有前导静音时会吞掉第一个音节，补 0.3 秒静音。
-                s.accept_waveform(SAMPLE_RATE, np.concatenate([np.zeros(int(0.3 * SAMPLE_RATE), dtype=np.float32), value]))
-                asr.decode_stream(s)
-                text = strip_fillers(s.result.text.strip())
+                # 只有 VAD 切出的语音段才送识别，静音不会到这里。VAD 段几乎没有前导静音，实测 Whisper 也会
+                # 吞掉第一个音节（“把 timeout 改成”只剩“改成”），偶尔还会输出提示词，补 0.3 秒静音。
+                text = strip_fillers(transcribe(asr, np.concatenate([np.zeros(int(0.3 * SAMPLE_RATE), dtype=np.float32), value])).strip())
                 asr_ms = int((time.monotonic() - t0) * 1000)
                 if text:
                     emit("transcript", text=text, audioMs=int(len(value) / SAMPLE_RATE * 1000), asrMs=asr_ms)

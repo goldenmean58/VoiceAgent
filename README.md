@@ -2,7 +2,7 @@
 
 在 [Herdr](https://herdr.dev) 里运行的本地语音助手：一个常驻的**主 agent**（Claude Code 或 Codex）听你说话、回答问题，并把代码工作派给一个**工作 agent**（同样是 Claude Code 或 Codex），再审核结果、用语音汇报。
 
-唤醒、录音、识别和朗读都在本机完成（sherpa-onnx），不需要额外的 LLM API key；两个 agent 都用你已有的 CLI 登录和额度。
+唤醒、录音、识别和朗读都在本机完成（唤醒、端点检测和朗读用 sherpa-onnx，识别用 MLX Whisper），不需要额外的 LLM API key；两个 agent 都用你已有的 CLI 登录和额度。
 
 完整设计、状态机和验收场景见 [design.md](design.md)。
 
@@ -29,7 +29,7 @@
 - [Herdr](https://herdr.dev) 0.9.5 或更高，服务器在运行
 - Node.js 24（只用标准库，不需要 `npm install`）
 - Claude Code 和/或 Codex CLI，已登录
-- 语音功能还需要：[uv](https://docs.astral.sh/uv/)、Python 3.14，以及一个麦克风
+- 语音功能还需要：[uv](https://docs.astral.sh/uv/)、Python 3.14、Apple Silicon（识别用 MLX），以及一个麦克风
 
 ## 安装
 
@@ -88,14 +88,23 @@ uv venv --python 3.14 audio/.venv
 uv pip install --python audio/.venv/bin/python -r audio/requirements.txt
 ```
 
+`mlx-whisper` 会连带装上 torch、numba、scipy 等依赖，虚拟环境约 1.1 GB。
+
 下载模型到 `~/.local/share/voice-assistant/models/` 并解压（不会自动下载）：
 
 ```bash
 B=https://github.com/k2-fsa/sherpa-onnx/releases/download
 curl -LO $B/kws-models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2
 curl -LO $B/asr-models/silero_vad.onnx
-curl -LO $B/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2
 curl -LO $B/tts-models/kokoro-multi-lang-v1_1.tar.bz2
+```
+
+识别模型 Whisper large-v3（MLX FP16，约 3 GB）从 Hugging Face 下载到同一目录，固定版本：
+
+```bash
+audio/.venv/bin/hf download mlx-community/whisper-large-v3-mlx config.json weights.npz \
+  --revision 49e6aa286ad60c14352c404340ded53710378a11 \
+  --local-dir ~/.local/share/voice-assistant/models/whisper-large-v3-mlx
 ```
 
 然后准备两个文件：
@@ -106,7 +115,7 @@ curl -LO $B/tts-models/kokoro-multi-lang-v1_1.tar.bz2
   n ǐ h ǎo d īng l uò @你好叮洛
   ```
 
-- **模型清单** `~/.config/voice-assistant/models/manifest.json`：写明 `kws`、`vad`、`asr`、`tts` 各模型文件的绝对路径和参数，字段名与 `audio/voice.py` 中的 `load_models` 一致。TTS 关键参数：`speakerId`（推荐 12，原因见"已知问题"）。语速不在清单里，由 `config.json` 的 `voice.ttsSpeed` 配置。
+- **模型清单** `~/.config/voice-assistant/models/manifest.json`：写明 `kws`、`vad`、`asr`、`tts` 各模型文件的绝对路径和参数，字段名与 `audio/voice.py` 中的 `load_models` 一致。ASR 填 `model`（上面的模型目录）、`language`（固定 `zh`，自动语言识别更慢且不更准）和 `initialPrompt`（推荐“以下是普通话与英语夹杂的语音，请使用简体中文，保留英语原文。”）。TTS 关键参数：`speakerId`（推荐 12，原因见"已知问题"）。语速不在清单里，由 `config.json` 的 `voice.ttsSpeed` 配置。
 
 音频进程启动时会检查清单里的文件是否存在，以及唤醒短语是否和 keywords 文件一致；缺什么就报什么，不会自动补。
 
@@ -208,5 +217,5 @@ design.md           设计文档与验收记录
 - kokoro int8 合成一两个字的短句时，部分音色会输出全 NaN，播出来没有声音（sid 3 几乎每次都出现）。
   - 因此改用 fp32 版（`kokoro-multi-lang-v1_1`）：本机实测没有再出现 NaN，合成也更快；
   - 合成结果含 NaN 时仍报告为合成失败，不算作"已播放"。
-- SenseVoice 偶尔把"叮洛"识别成"丁落"。
+- 识别用 Whisper large-v3，说完后约 1.2 秒出文字（M4，不含 VAD 的句末静音等待），常驻内存约 3.4 GB。英文技术词仍会听错（如 CI 听成"赛"、Claude 听成"Cluid"），合成语音上偶尔整句输出与内容无关的套话（如"本视频由……制作"）。裸 Whisper 对静音会凭空输出文字，所以只有 VAD 判定有语音的片段才送识别。
 - 播报中说唤醒词可以打断（也可以在控制台按回车或 `/stop`）。没有回声消除：外放音量大、用户声音不比外放回声高约 6dB 时可能唤不醒；口播内容本身含唤醒词（或同音词）的那一段播放期间不检测唤醒词。
