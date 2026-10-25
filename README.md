@@ -161,6 +161,7 @@ node src/main.mjs listen --voice
 
 - 第一版两个 agent 都以**最大权限**启动：Claude 加 `--dangerously-skip-permissions`，Codex 加 `--dangerously-bypass-approvals-and-sandbox`。只把你信任的目录放进 `allowedRoots`。
 - 主 agent 只开放 Bash（`--tools Bash --strict-mcp-config`）。它可以自己做查路径、看文件这类简单查询，改代码和较长的工作交给工作 agent。
+- 本助手启动的 Claude 工作 agent 加 `--disallowedTools AskUserQuestion`，需要你决定时在回复里用文本列出问题和选项，由主 agent 转问；接管的会话不改启动参数，只靠投递文本里的同一条约定。
 - 工作 agent 的结果对主 agent 来说是待审核的外部数据，不能代替你授权。主 agent 判断"已完成"之前必须有证据。
 - 唤醒前的音频只在本机处理；只有你说的那句话的最终转写会发给主 agent。
 

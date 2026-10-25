@@ -737,6 +737,8 @@ daemon 对外提供本用户可访问的 Unix socket，运行目录权限 0700�
 
 Claude 主 agent 额外传 `--tools Bash --strict-mcp-config`：主 agent 只用 Bash 调用工具命令，不需要其他内置工具和用户配置的 MCP 工具。用 `claude -p` 实测只回复一句话时的上下文：默认 31,606 token；只留 Bash 时 20,574 token（剩余的主要是 MCP 工具定义）；再加 `--strict-mcp-config` 后 7,427 token。
 
+本助手启动的 Claude 工作 agent 额外传 `--disallowedTools AskUserQuestion`：该工具的选项只显示在 pane 里，Stop Hook 拿到的最终消息不含这些选项，主 agent 无法转述。daemon 投递给 Claude 工作 agent 的文本末尾附一条约定：不要使用 AskUserQuestion，需要用户决定时在回复末尾用文本写出问题和编号选项后结束本轮。接管的会话不重启、不改启动参数，只靠这条约定。
+
 实测 Sonnet + medium 主 agent（交互模式）：
 - 首次调用的上下文为 9,125 token，原来是约 5.1 万。
 - 一次完整往返共 7 次调用、上下文合计约 9.5 万 token，原来是每次调用重读 6 万到 8 万。往返包括启动 worker、投递、读结果、判断和两次口播，审核结论与实际结果一致。

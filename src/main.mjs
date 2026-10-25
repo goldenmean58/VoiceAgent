@@ -341,6 +341,9 @@ function launchArgs(role, kind, agentId, nativeSessionId) {
       args.push("--tools", "Bash", "--strict-mcp-config");
       if (config.main.model) args.push("--model", config.main.model);
       if (config.main.effort) args.push("--effort", config.main.effort);
+    } else {
+      // 硬限制：AskUserQuestion 的选项主 agent 拿不到；接管的会话不重启，只靠 WORKER_ASK_NOTE。
+      args.push("--disallowedTools", "AskUserQuestion");
     }
     return args;
   }
@@ -502,12 +505,16 @@ function enqueueUpdate(task, detail) {
   notify("task", `${task.title}：${detail}`, { taskId: task.taskId, state: task.state });
 }
 
+const WORKER_ASK_NOTE = "（语音助手约定：不要使用 AskUserQuestion 工具。需要用户决定时，在回复末尾用文本写出问题和编号选项，然后结束本轮。）";
+
 async function sendToWorker(task, agent, text) {
   const sub = {
     id: randomUUID(), role: "worker", agentId: agent.agentId, taskId: task.taskId, generation: agent.generation,
     status: "prepared", createdAt: now(), turnKey: null, stop: null, bgTaskIds: [],
   };
   sub.text = `[voice-assistant submission=${sub.id}]\n${text}`;
+  // AskUserQuestion 的选项只在 pane 里，Stop Hook 的最终消息拿不到，主 agent 无法转述。
+  if (agent.kind === "claude") sub.text += `\n\n${WORKER_ASK_NOTE}`;
   S.subs[sub.id] = sub;
   agent.activeSubmissionId = sub.id;
   task.activeSubmissionId = sub.id;
