@@ -40,6 +40,8 @@ const SESSION_START_TIMEOUT_MS = 20000;
 
 const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 主助手回复在终端里加粗青色；输出被重定向时不加控制码。
+const styleReply = (type, line) => (type === "reply" && process.stdout.isTTY ? `\x1b[1;36m${line}\x1b[0m` : line);
 
 class ToolError extends Error {
   constructor(code, message, extra = {}) {
@@ -302,7 +304,7 @@ let scheduling = false;
 
 function notify(type, text, extra = {}) {
   const msg = { type, at: now(), text, ...extra };
-  process.stdout.write(`[${msg.at.slice(11, 19)}] ${type}: ${text}\n`);
+  process.stdout.write(styleReply(type, `[${msg.at.slice(11, 19)}] ${type}: ${text}`) + "\n");
   for (const w of watchers) w.write(JSON.stringify(msg) + "\n");
 }
 
@@ -1786,7 +1788,7 @@ async function listenCommand(flags) {
       buf = buf.slice(nl + 1);
       if (msg.rpcId === "watch") continue;
       const prefix = { reply: "主助手", heard: "你说", voice: "语音" }[msg.type] ?? msg.type;
-      process.stdout.write(`\n[${msg.at.slice(11, 19)}] ${prefix}：${msg.text}\n> `);
+      process.stdout.write(`\n${styleReply(msg.type, `[${msg.at.slice(11, 19)}] ${prefix}：${msg.text}`)}\n> `);
     }
   });
   sock.on("close", () => { process.stdout.write("\ndaemon 连接已断开\n"); process.exit(1); });
