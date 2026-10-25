@@ -1281,17 +1281,32 @@ const TOOLS = {
     return { agent: agentView(agent) };
   },
 
-  async "agents.release"({ agentId }) {
+  async "agents.release"({ agentId, closePane = false }) {
     const agent = S.agents[agentId];
     if (!agent || agent.role !== "worker" || agent.released) throw new ToolError("not_found", `受管工作 agent 不存在：${agentId}`);
     const unfinished = Object.values(S.tasks).find((t) => t.workerAgentId === agentId && !TERMINAL_STATES.has(t.state));
     if (unfinished) throw new ToolError("task_unfinished", `任务 ${unfinished.taskId} 尚未结束（${unfinished.state}）`);
     if (agent.activeSubmissionId) throw new ToolError("agent_busy", "工作 agent 还有未结束的回合");
+    if (closePane) {
+      // 关闭会结束 pane 里的 CLI 进程，不可逆：接管的会话属于用户，手动控制或外部回合中的会话可能有用户在操作。
+      if (agent.adopted) throw new ToolError("not_closable", "接管的会话属于用户，只能释放，不能关闭 pane");
+      if (agent.control !== "managed") throw new ToolError("agent_paused", "工作 agent 处于手动控制，不能关闭 pane；需先核验并恢复");
+      if (agent.externalTurnKey) throw new ToolError("agent_busy", "工作 agent 有非本系统发起的回合，不能关闭 pane");
+      const obs = await herdr.inspect(agent.backendRef, agent.kind);
+      if (!obs.reachable) throw new ToolError("backend_unreachable", `无法查询工作 agent 状态：${obs.reason}`);
+      if (obs.present && obs.activity !== "ready") throw new ToolError("agent_busy", `工作 agent 当前状态为 ${obs.activity}，不能关闭 pane`);
+      if (obs.present && obs.nativeSessionId && agent.nativeSessionId && obs.nativeSessionId !== agent.nativeSessionId) {
+        throw new ToolError("identity_changed", `pane 中的会话已变为 ${obs.nativeSessionId}，不能关闭`);
+      }
+      const r = await herdr.close(agent.backendRef);
+      if (!r.ok) throw new ToolError("close_failed", `关闭 pane 失败：${r.reason}`);
+      agent.activity = "exited";
+    }
     agent.released = true;
     saveAgent(agent);
     commit();
     if (agent.adopted) writeRegistry();
-    return { released: agentId };
+    return { released: agentId, paneClosed: closePane };
   },
 
   // 按设计第 5.3 节接管用户明确指定的既有会话；任一检查不通过都不接管。

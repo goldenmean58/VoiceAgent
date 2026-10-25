@@ -216,7 +216,7 @@ TaskRecord 的 state、activeSubmissionId、pendingRequestId、latestResultEvent
 
 ### 5.1 最小后端契约
 
-业务只调用下面六个操作。第一版允许它只有 Herdr 一个实现，因为“可替换 Herdr”是明确需求；不再为音频、模型或存储扩展一套插件框架。
+业务只调用下面七个操作。第一版允许它只有 Herdr 一个实现，因为“可替换 Herdr”是明确需求；不再为音频、模型或存储扩展一套插件框架。
 
 ```typescript
 interface AgentBackend {
@@ -225,6 +225,7 @@ interface AgentBackend {
   inspect(binding: AgentBinding): Promise<AgentObservation>;
   submit(input: SubmitInput): Promise<DeliveryReceipt>;
   cancel(input: CancelInput): Promise<CancelReceipt>;
+  close(binding: AgentBinding): Promise<CloseReceipt>;
   subscribe(onChange: (event: BackendChange) => void): Promise<() => void>;
 }
 
@@ -287,6 +288,9 @@ type CancelReceipt = {
   status: "requested" | "unsupported" | "unknown";
   reason?: string;
 };
+
+// 对象已不存在或已被其他终端占用时视为已关闭，不关闭别人的 pane。
+type CloseReceipt = { ok: true } | { ok: false; reason: string };
 ```
 
 `AgentCandidate` 只暴露 kind、cwd、native session、activity、可供接管的 opaque reference，以及可用能力。`AgentObservation` 返回当前身份、状态和观察时间。布局、终端按键、Herdr 请求字段都留在实现内。
@@ -306,6 +310,7 @@ Herdr 的 `agent prompt` 也接受 working 状态的 agent，成功响应只表�
 | `inspect` | 查询绑定对象，确认仍为原来的 CLI/native session |
 | `submit` | 通过 agent 输入接口定向提交文本；不使用 shell 命令模拟 prompt |
 | `cancel` | 按已核验的 CLI 行为中断当前回合，并随后观察是否真正停止 |
+| `close` | 确认 pane 仍是原来的终端后用 `herdr pane close` 关闭；pane 已不存在时视为已关闭 |
 | `subscribe` | 订阅状态/退出/替换事件，转为应用的变化通知 |
 
 Herdr 区分布局、原始 pane 和被识别的 agent；启动 agent 需要一个已有 shell pane，创建后应使用返回的 ID。第一版据此把布局放在后端内部。[Herdr agent automation](https://herdr.dev/docs/agent-automation/)
@@ -348,7 +353,7 @@ Herdr 的 Claude/Codex 集成可报告原生会话引用，但不能据此假设
 | `agents.list` | 无 | 列出受管与可接管对象，不改变控制权 |
 | `agents.start` | kind、cwd、显示名 | 启动工作 agent；已有受管工作对象时拒绝再建一个 |
 | `agents.adopt` | candidateRef | 按第 5.3 节检查并接管 |
-| `agents.release` | agentId | 空闲且无未结束任务时解除工作 agent 的自动管理，保留原生会话 |
+| `agents.release` | agentId，可选 closePane | 空闲且无未结束任务时解除工作 agent 的自动管理；默认保留原生会话，closePane 为 true 时同时关闭其 pane |
 | `tasks.submit` | agentId、originMessageId、任务文本 | 创建任务并投递首轮输入 |
 | `tasks.send` | taskId、expectedRevision、补充文本 | 在同一任务/会话中继续；忙时保存待发送输入 |
 | `tasks.get` | taskId；可选结果读取范围 | 返回确定状态、待处理问题和原始结果内容 |
@@ -365,7 +370,9 @@ worker、主 agent 与 daemon 以同一系统用户运行，同一用户的进�
 
 工具不向主 agent 暴露任意 `send-keys`、shell pane 控制或原生权限批准接口。主 agent 以最大权限运行（第 3.2 节），不直接调用 Herdr、不直接改代码只是提示词约定，没有强制力。工作 agent 的普通原生工具仍由其自身权限策略管理。
 
-主 agent 工具只能启动、接管、释放或暂停工作 agent；主会话的启动和控制属于 daemon/用户控制台。释放时保留历史关联、不关闭 pane；之后可接管或启动另一个工作会话，同一时刻受管数量不超过 worker.maxManaged。
+主 agent 工具只能启动、接管、释放或暂停工作 agent；主会话的启动和控制属于 daemon/用户控制台。释放时保留历史关联，默认不关闭 pane；之后可接管或启动另一个工作会话，同一时刻受管数量不超过 worker.maxManaged。
+
+释放后的 pane 会一直留在 daemon 所在的 tab，越积越多，所以 `agents.release` 可带 `closePane: true` 同时关闭 pane。关闭会结束其中的 CLI 进程，不可逆（原生会话历史仍在磁盘上），因此只在用户明确要求关掉时使用，并额外拒绝以下情况：接管的会话（属于用户）、处于手动控制、有非本系统发起的回合、当前不是 ready，或 pane 中的会话身份已变。先由后端关闭成功，再标记 released；关闭失败返回 `close_failed`，agent 保持受管。
 
 ### 6.2 结果处理决定
 
@@ -841,7 +848,7 @@ Herdr 订阅事件不持久、不会自动重放；events_lost 会结束订阅�
 ```text
 src/
   main.mjs             # CLI、daemon、IPC、状态、队列、Hook 标准化
-  herdr.mjs            # 六个后端操作、Herdr 绑定和诊断
+  herdr.mjs            # 七个后端操作、Herdr 绑定和诊断
 audio/
   voice.py             # 音频采集、模型、转写与播放
 prompts/
@@ -899,6 +906,7 @@ A/B/C 都是开发里程碑；D 完成后才称第一版满足本设计。实施
 | V29 | Codex 新 Hook 未信任，或 Claude 目标目录未信任 | 启动预检直接报告原因，不启动 agent，也不向审核或信任界面投递输入 |
 
 V16 是第一版目标验收线，不是对所有麦克风、口音和环境的性能承诺。记录实际设备、模型版本、短语与阈值，未达标就不能宣称该配置的免手操作已通过。
+| V30 | 释放空闲工作 agent 时 closePane 为 true；另对接管的会话、手动控制中的会话各试一次 | 自启动的 pane 关闭后才标记 released；接管或手动控制的会话被拒绝，pane 和受管状态不变 |
 
 关键耗时按“用户说完→转写完成”“主回复就绪→开始播放”“工作结果就绪→主 agent 处理”分别记录，区分排队、模型和音频耗时。首轮先建立真机基线，不预先承诺未经测量的端到端延迟。
 

@@ -1,4 +1,4 @@
-// Herdr 后端：只向应用暴露 discover/start/inspect/submit/cancel。
+// Herdr 后端：只向应用暴露 discover/start/inspect/submit/cancel/close。
 // pane、terminal、agent 名称和 Herdr 错误码都留在本文件内；backendRef 对业务代码不透明。
 import { execFile } from "node:child_process";
 import net from "node:net";
@@ -160,4 +160,15 @@ export async function submit(backendRef, text) {
 export async function cancel(backendRef, kind) {
   const r = await run(["agent", "send-keys", JSON.parse(backendRef).paneId, kind === "claude" ? "ctrl+c" : "esc"]);
   return r.ok ? { status: "requested" } : { status: "unknown", reason: r.message };
+}
+
+// 关闭 backendRef 对应的 pane，其中的 CLI 进程随之结束。pane 已不存在或已换了终端时视为已关闭，不去动别人的 pane。
+export async function close(backendRef) {
+  const { paneId, terminalId } = JSON.parse(backendRef);
+  const got = await run(["pane", "get", paneId]);
+  if (!got.ok) return got.code === "pane_not_found" ? { ok: true } : { ok: false, reason: got.message };
+  if (got.result.pane.terminal_id !== terminalId) return { ok: true };
+  const r = await run(["pane", "close", paneId], { json: false });
+  if (r.ok || r.code === "pane_not_found") return { ok: true };
+  return { ok: false, reason: r.message };
 }

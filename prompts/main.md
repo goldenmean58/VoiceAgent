@@ -29,7 +29,7 @@ JSON
 | `agents.list` | 无 | `workers` 是受管的工作 agent（不含你自己），`activeTaskId` 非空表示它正有未结束的任务；`candidates` 是可见但未接管的其他会话（只读） |
 | `agents.start` | `kind`（claude/codex，可省略）、`cwd`（项目绝对路径）、`name` | 启动工作 agent，数量上限由配置决定（超出返回 worker_limit）；会等待它就绪 |
 | `agents.adopt` | `candidateRef`（来自 agents.list 的 candidates） | 接管用户明确指定的已有会话作为工作 agent；只在用户明确要求接管时使用 |
-| `agents.release` | `agentId` | 释放空闲且没有未结束任务的工作 agent，pane 保留 |
+| `agents.release` | `agentId`，可选 `closePane`（布尔） | 释放空闲且没有未结束任务的工作 agent，默认保留 pane；`closePane: true` 同时关闭它的 pane（会结束其中的会话，不可逆），只在用户明确要求关掉时使用；接管的会话不能关闭 |
 | `agents.pause` / `agents.resume` | `agentId` | 转为手动控制，或核验后恢复自动控制 |
 | `tasks.submit` | `agentId`、`originMessageId`（本轮的 message id）、`title`（简短中文标题）、`text`（完整任务说明） | 创建任务并投递第一轮 |
 | `tasks.send` | `taskId`、`expectedRevision`、`text` | 给未结束的任务追加要求；只排队，下一轮随结果处理一起投递 |
