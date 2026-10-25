@@ -68,7 +68,7 @@ flowchart TD
     R -->|定向输入| B[AgentBackend 契约]
     B --> H[Herdr 实现]
     H --> M[主 agent\nClaude Code 或 Codex]
-    H --> W[一个工作 agent\nClaude Code 或 Codex]
+    H --> W[工作 agent（可多个）\nClaude Code 或 Codex]
     M -->|本地工具调用| R
     M -->|最终回复 Hook| R
     W -->|最终消息 Hook| R
@@ -202,7 +202,7 @@ TaskRecord 的 state、activeSubmissionId、pendingRequestId、latestResultEvent
 
 ### 4.3 必须保持的不变量
 
-1. 一个主 agent、最多一个受管工作 agent；一个工作 agent 同时最多有一个未结束的任务。
+1. 一个主 agent、最多 `worker.maxManaged` 个受管工作 agent；一个工作 agent 同时最多有一个未结束的任务。
 2. 同一 agent 同时最多有一个自动投递中的回合；主 agent 忙时只排队。
 3. 每次发送前核对 native session、generation、控制权和当前状态；Codex 首轮尚无 native session 时，改为核对 agentId 环境标记绑定的 pane 占用者未变。
 4. 主 agent 的最终回复才进入 TTS。工作结果必须先交主 agent 处理。
@@ -364,7 +364,7 @@ worker、主 agent 与 daemon 以同一系统用户运行，同一用户的进�
 
 工具不向主 agent 暴露任意 `send-keys`、shell pane 控制或原生权限批准接口。主 agent 以最大权限运行（第 3.2 节），不直接调用 Herdr、不直接改代码只是提示词约定，没有强制力。工作 agent 的普通原生工具仍由其自身权限策略管理。
 
-主 agent 工具只能启动、接管、释放或暂停工作 agent；主会话的启动和控制属于 daemon/用户控制台。释放时保留历史关联、不关闭 pane；之后可接管或启动另一个工作会话，但同一时刻仍最多管理一个。
+主 agent 工具只能启动、接管、释放或暂停工作 agent；主会话的启动和控制属于 daemon/用户控制台。释放时保留历史关联、不关闭 pane；之后可接管或启动另一个工作会话，同一时刻受管数量不超过 worker.maxManaged。
 
 ### 6.2 结果处理决定
 
@@ -655,10 +655,11 @@ SenseVoice 与 Kokoro 的选型参考官方模型文档；实现前固定兼容�
   - 端点检测：silero_vad.onnx
   - 识别：sense-voice-zh-en-ja-ko-yue-int8-2025-09-09
   - 合成：kokoro-int8-multi-lang-v1_1，音色 sid 12（最初选 sid 3 / zf_001，因短句 NaN 问题更换，见下文）
-- 模型清单在 `~/.config/voice-assistant/models/manifest.json`，记录模型路径、哈希和选定参数。keywords 文件按 ppinyin 规则手写，逐个 token 核对过它们都在模型词表中，没有引入 text2token 需要的额外依赖。音频进程启动时核对唤醒短语与 keywords 文件一致。
+- 模型清单在 `~/.config/voice-assistant/models/manifest.json`，记录模型路径、哈希和选定参数；播报语速不在清单里，由 config.json 的 voice.ttsSpeed 配置，daemon 校验后随 voice 段下发给音频进程。keywords 文件按 ppinyin 规则手写，逐个 token 核对过它们都在模型词表中，没有引入 text2token 需要的额外依赖。音频进程启动时核对唤醒短语与 keywords 文件一致。
 - 播报按句流水线合成：播放当前句时合成下一句；首句较长且逗号前至少 4 个字时，先在第一个逗号处切开。实测 149 字的回复从就绪到开始播放约 1.6 秒，`/stop` 约 0.2 秒生效。
 - 实测 kokoro int8 合成一两个字的短句时，部分音色会输出全 NaN，播放时没有声音。sid 3 上“好的”“我在”“收到。”几乎每次都是 NaN；扫描 sid 3–57 后，12、15、18、24、29、31、32、35、37、38、40–53、56 在 20 条常见短回复上没有出现 NaN，但单字句（如“嗯。”“对。”）在其他一些音色上仍会出现。因此合成结果含 NaN 时按合成失败报告，不记为 played。
-- 唤醒应答：音频进程启动时用当前音色以 1.3 倍语速合成一次“我在”，裁掉首尾静音后留在内存，之后每次唤醒或按键录音直接播放，不再现场合成。合成失败（含 NaN）时音频进程启动失败，并提示更换 speakerId。实测从收到录音请求到开始录音约 0.79 秒（sid 12），主要是这两个字本身的播放时长。应答播放期间的采集被丢弃，用户需在“我在”之后再开口。
+- 唤醒应答：音频进程启动时用当前音色以固定 1.3 倍语速合成一次“我在”（不随 ttsSpeed：sid 12、4 线程下实测应答为 1.95 倍时“我在”38/40、“收到”31/40 输出 NaN，1.3/1.5/1.7 倍各 40 次均无；numThreads 为 1 时即使 1.0 倍也几乎每次 NaN），裁掉首尾静音后留在内存，之后每次唤醒或按键录音直接播放，不再现场合成。合成失败（含 NaN）时音频进程启动失败，并提示更换 speakerId。实测从收到录音请求到开始录音约 0.79 秒（sid 12），主要是这两个字本身的播放时长。应答播放期间的采集被丢弃，用户需在“我在”之后再开口。
+- 收到应答：同样在启动时缓存一段“收到”。VAD 判定一句话结束后立即非阻塞播放，与语音识别并行；播放期间及其后 playbackGuardMs 内不检测唤醒词，回到待唤醒前等它播完，避免被录音期间暂存的回复截断。
 
 ### 11.2 名称与唤醒短语
 
@@ -726,6 +727,7 @@ daemon 对外提供本用户可访问的 Unix socket，运行目录权限 0700�
     "wakePhrase": "你好叮洛",
     "modelManifest": "/absolute/path/to/models/manifest.json",
     "playbackGuardMs": 300,
+    "ttsSpeed": 1.2,
     "waitForSpeechMs": 5000,
     "endSilenceMs": 1200,
     "maxUtteranceMs": 30000
@@ -746,7 +748,7 @@ Claude 主 agent 额外传 `--tools Bash --strict-mcp-config`：主 agent 只用
   - 主 agent 曾把 `agents.list` 里的自己当成工作 agent 汇报。现在 `agents.list` 只返回 `workers`（不含主 agent）和 `candidates`。
   - 用户只给了项目名、没给路径时，主 agent 自己用 `ls`/`find` 搜索了用户目录。经用户确认，取消"主 agent 不运行命令"的约定：查路径、看文件这类简单查询允许主 agent 自己做，改代码和较长的工作仍委派给工作 agent；主 agent 仍不直接调用 herdr。
 
-配置缺失/非法即报告字段错误，不默选其他模型、项目或后端。项目路径先 realpath 再判断是否位于 allowedRoots 中。maxManaged 在第一版只能为 1，不能通过改配置宣称多 worker 已被支持。
+配置缺失/非法即报告字段错误，不默选其他模型、项目或后端。项目路径先 realpath 再判断是否位于 allowedRoots 中。maxManaged 必须为正整数，是同时受管工作 agent 的上限；任务、结果和请求都按 taskId/agentId 归属，多个工作 agent 互不影响。
 
 不配置第二套 LLM API key。模型清单记录本地模型文件、哈希和选定参数；缺少模型时报告缺失项，不启动下载。
 

@@ -91,7 +91,7 @@ function loadConfig() {
     if (!levels.includes(c.main.effort)) errs.push(`main.effort 必须为 ${levels.join("/")} 之一`);
   }
   if (!KINDS.includes(c.worker?.defaultKind)) errs.push("worker.defaultKind 必须为 claude 或 codex");
-  if (c.worker?.maxManaged !== 1) errs.push("worker.maxManaged 第一版只能为 1");
+  if (!Number.isInteger(c.worker?.maxManaged) || c.worker.maxManaged < 1) errs.push("worker.maxManaged 必须为正整数");
   if (!Number.isInteger(c.worker?.maxAutoContinue) || c.worker.maxAutoContinue < 0) errs.push("worker.maxAutoContinue 必须为非负整数");
   const roots = [];
   if (!Array.isArray(c.projects?.allowedRoots) || c.projects.allowedRoots.length === 0) {
@@ -112,6 +112,7 @@ function loadConfig() {
     for (const k of ["playbackGuardMs", "waitForSpeechMs", "endSilenceMs", "maxUtteranceMs"]) {
       if (!Number.isInteger(v[k]) || v[k] <= 0) errs.push(`voice.${k} 必须为正整数`);
     }
+    if (typeof v.ttsSpeed !== "number" || !Number.isFinite(v.ttsSpeed) || v.ttsSpeed <= 0) errs.push("voice.ttsSpeed 必须为正数");
   }
   if (errs.length) throw new Error(`配置 ${CONFIG_FILE} 无效：\n- ${errs.join("\n- ")}`);
   return { ...c, allowedRoots: roots };
@@ -309,8 +310,13 @@ function mainAgent() {
   return S.meta.main ? S.agents[S.meta.main.agentId] : null;
 }
 
-function managedWorker() {
-  return Object.values(S.agents).find((a) => a.role === "worker" && !a.released && a.activity !== "exited") || null;
+function managedWorkers() {
+  return Object.values(S.agents).filter((a) => a.role === "worker" && !a.released && a.activity !== "exited");
+}
+
+function checkWorkerLimit() {
+  const n = managedWorkers().length;
+  if (n >= config.worker.maxManaged) throw new ToolError("worker_limit", `已管理 ${n} 个工作 agent，达到 worker.maxManaged 上限；先释放一个再启动或接管`);
 }
 
 function activeSub(agent) {
@@ -1232,8 +1238,12 @@ const TOOLS = {
     const managedRefs = new Set(Object.values(S.agents).map((a) => a.backendRef));
     const candidates = (await herdr.discover()).filter((c) => !managedRefs.has(c.candidateRef));
     // 不列出主 agent 自己：实测 Sonnet 会把列表里的主 agent 当成工作 agent 汇报。
-    const workers = Object.values(S.agents).filter((a) => a.role === "worker" && !a.released && a.activity !== "exited");
-    return { workers: workers.map(agentView), candidates };
+    // activeTaskId 让主 agent 在多个工作 agent 中挑出空闲的那个。
+    const workers = managedWorkers().map((a) => {
+      const task = Object.values(S.tasks).find((t) => t.workerAgentId === a.agentId && !TERMINAL_STATES.has(t.state));
+      return { ...agentView(a), activeTaskId: task?.taskId ?? null };
+    });
+    return { workers, candidates };
   },
 
   async "agents.start"({ kind = config.worker.defaultKind, cwd, name }) {
@@ -1246,9 +1256,7 @@ const TOOLS = {
     if (!config.allowedRoots.some((r) => real === r || real.startsWith(r + path.sep))) {
       throw new ToolError("cwd_not_allowed", `${real} 不在 projects.allowedRoots 内`);
     }
-    if (managedWorker()) throw new ToolError("worker_limit", "第一版最多管理一个工作 agent；先释放现有工作 agent");
-    const unfinished = Object.values(S.tasks).find((t) => !TERMINAL_STATES.has(t.state));
-    if (unfinished) throw new ToolError("task_unfinished", `仍有未结束的任务 ${unfinished.taskId}（${unfinished.state}）`);
+    checkWorkerLimit();
     const agent = await launchAgent("worker", kind, real, name || `${kind} 工作 agent`);
     notify("agent", `已启动工作 agent（${kind}，${real}）`);
     return { agent: agentView(agent) };
@@ -1274,9 +1282,6 @@ const TOOLS = {
     if (cand.isCaller) throw new ToolError("not_adoptable", "这是 daemon 自己所在的会话，不能接管");
     if (Object.values(S.agents).some((a) => a.backendRef === candidateRef && watched(a))) throw new ToolError("already_managed", "该会话已经受管");
     if (!KINDS.includes(cand.kind)) throw new ToolError("unsupported_kind", `不支持接管 ${cand.kind}`);
-    if (managedWorker()) throw new ToolError("worker_limit", "第一版最多管理一个工作 agent；先释放现有工作 agent");
-    const unfinished = Object.values(S.tasks).find((t) => !TERMINAL_STATES.has(t.state));
-    if (unfinished) throw new ToolError("task_unfinished", `仍有未结束的任务 ${unfinished.taskId}（${unfinished.state}）`);
     let real;
     try { real = realpathSync(cand.cwd); } catch { throw new ToolError("bad_input", `会话目录不存在：${cand.cwd}`); }
     if (!config.allowedRoots.some((r) => real === r || real.startsWith(r + path.sep))) throw new ToolError("cwd_not_allowed", `${real} 不在 projects.allowedRoots 内`);
@@ -1286,6 +1291,7 @@ const TOOLS = {
     }
     const obs = await herdr.inspect(candidateRef, cand.kind);
     if (!obs.present || obs.activity !== "ready") throw new ToolError("agent_busy", `该会话当前状态为 ${obs.activity}；空闲且没有原生弹窗时才能接管`);
+    checkWorkerLimit(); // 放在最后一次 await 之后，与登记之间没有让出点
     const agent = {
       agentId: randomUUID(), role: "worker", kind: cand.kind, nativeSessionId: cand.nativeSessionId, generation: 1, cwd: real,
       displayName: `接管的 ${cand.kind} 会话`, control: "managed", activity: "ready", activeSubmissionId: null,

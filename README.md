@@ -20,7 +20,7 @@
 
 - **daemon**（`src/main.mjs`）：唯一的状态写入者。状态保存在只追加的 journal 中，重启后可以恢复；通过 Herdr 事件订阅和原生 Hook 判断回合的开始和结束。
 - **主 agent**：负责理解你的话、派发任务、审核工作结果、总结口播，通过 `voice-assistant tool <action>` 调用 daemon。
-- **工作 agent**：最多一个，在你允许的项目目录里干活。也可以接管 Herdr 里已经在运行的 Claude/Codex 会话。
+- **工作 agent**：可同时管理多个（上限由 `worker.maxManaged` 决定），各自在你允许的项目目录里干活，每个同时最多一个未结束任务。也可以接管 Herdr 里已经在运行的 Claude/Codex 会话。
 - **音频进程**（`audio/voice.py`）：负责唤醒词、VAD、语音识别和语音合成，在有麦克风权限的终端里启动。
 
 ## 环境要求
@@ -49,6 +49,7 @@
     "wakePhrase": "你好叮洛",
     "modelManifest": "/Users/you/.config/voice-assistant/models/manifest.json",
     "playbackGuardMs": 300,
+    "ttsSpeed": 1.2,
     "waitForSpeechMs": 5000,
     "endSilenceMs": 1200,
     "maxUtteranceMs": 30000
@@ -60,11 +61,12 @@
 | --- | --- |
 | `main.kind` / `worker.defaultKind` | `claude` 或 `codex` |
 | `main.model` / `main.effort` | 可省略，省略时沿用 CLI 默认值。Claude 的 effort 可选 `low`/`medium`/`high`/`xhigh`/`max`；Codex 可选 `minimal`/`low`/`medium`/`high`/`xhigh` |
-| `worker.maxManaged` | 第一版只能为 1 |
+| `worker.maxManaged` | 同时受管的工作 agent 上限（正整数）；达到上限后启动或接管会返回 `worker_limit` |
 | `worker.maxAutoContinue` | 主 agent 连续让工作 agent"继续"的次数上限，用完后只能问你或给出结论 |
 | `projects.allowedRoots` | 工作 agent 只能在这些目录（含子目录）中启动或被接管 |
 | `voice` | 可省略；省略时只有文字控制台 |
 | `endSilenceMs` | 说话后静音多久算一句话结束 |
+| `ttsSpeed` | 播报语速倍数（正数），推荐 1.2；只影响回复播报，"我在""收到"两句应答固定按 1.3 倍合成 |
 
 配置缺失或非法时，daemon 会列出具体字段错误并拒绝启动，不会替你选一个默认值。
 
@@ -104,7 +106,7 @@ curl -LO $B/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2
   n ǐ h ǎo d īng l uò @你好叮洛
   ```
 
-- **模型清单** `~/.config/voice-assistant/models/manifest.json`：写明 `kws`、`vad`、`asr`、`tts` 各模型文件的绝对路径和参数，字段名与 `audio/voice.py` 中的 `load_models` 一致。TTS 关键参数：`speakerId`（推荐 12，原因见"已知问题"）和 `speed`。
+- **模型清单** `~/.config/voice-assistant/models/manifest.json`：写明 `kws`、`vad`、`asr`、`tts` 各模型文件的绝对路径和参数，字段名与 `audio/voice.py` 中的 `load_models` 一致。TTS 关键参数：`speakerId`（推荐 12，原因见"已知问题"）。语速不在清单里，由 `config.json` 的 `voice.ttsSpeed` 配置。
 
 音频进程启动时会检查清单里的文件是否存在，以及唤醒短语是否和 keywords 文件一致；缺什么就报什么，不会自动补。
 
@@ -137,7 +139,7 @@ node src/main.mjs listen --voice
 这一步不能在 Herdr 里跑：Herdr 服务器拉起的进程拿不到 macOS 的麦克风授权，只会录到全零的静音，而且系统不会弹授权提示。
 
 **3. 说话。**
-- 用唤醒词：说"你好叮洛"，听到"我在"后说出请求，停顿 `endSilenceMs` 毫秒即结束。
+- 用唤醒词：说"你好叮洛"，听到"我在"后说出请求，停顿 `endSilenceMs` 毫秒即结束，随后会听到"收到"。
 - 用按键：在控制台直接按回车开始录一句话。
 
 主 agent 的每条回复都会显示在控制台并朗读出来。

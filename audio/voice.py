@@ -81,7 +81,9 @@ def load_models(cfg):
 
 SENTENCE_END = re.compile(r"(?<=[。！？!?；;\n])")
 WAKE_ACK_TEXT = "我在"
-WAKE_ACK_SPEEDUP = 1.3  # 应答越短，用户越早能开口
+HEARD_ACK_TEXT = "收到"  # 一句话录完立即播报，不等主 agent
+# 应答用固定语速，不随 ttsSpeed：实测 sid 12 在 1.95 倍时“我在”“收到”约九成输出 NaN，1.3–1.7 倍未出现。
+ACK_SPEED = 1.3
 
 
 def synthesize(tts, text, sid, speed):
@@ -95,9 +97,9 @@ def synthesize(tts, text, sid, speed):
     return samples, audio.sample_rate
 
 
-def wake_ack(tts, sid, speed):
-    """启动时合成一次唤醒应答并裁掉首尾静音，之后每次唤醒直接播放。"""
-    samples, rate = synthesize(tts, WAKE_ACK_TEXT, sid, speed * WAKE_ACK_SPEEDUP)
+def wake_ack(tts, sid, text=WAKE_ACK_TEXT):
+    """启动时合成一次短应答并裁掉首尾静音，之后直接播放。"""
+    samples, rate = synthesize(tts, text, sid, ACK_SPEED)
     frame = int(0.01 * rate)
     rms = np.sqrt(np.mean(samples[: len(samples) // frame * frame].reshape(-1, frame) ** 2, axis=1))
     voiced = np.nonzero(rms > 0.1 * rms.max())[0]
@@ -212,9 +214,10 @@ class Recording:
 def main():
     cfg = json.loads(sys.argv[1])
     kws, asr, tts, vad_cfg, tts_params = load_models(cfg)
-    speaker = Speaker(tts, tts_params["speakerId"], tts_params["speed"], cfg["playbackGuardMs"])
+    speaker = Speaker(tts, tts_params["speakerId"], cfg["ttsSpeed"], cfg["playbackGuardMs"])
     try:
-        ack = wake_ack(tts, tts_params["speakerId"], tts_params["speed"])
+        ack = wake_ack(tts, tts_params["speakerId"])
+        heard = wake_ack(tts, tts_params["speakerId"], HEARD_ACK_TEXT)
     except RuntimeError as e:
         fail("wake_ack_failed", f"唤醒应答合成失败，请换一个 speakerId：{e}")
 
@@ -321,6 +324,9 @@ def main():
             if kind == "rejected":
                 emit("utterance_rejected", reason=value)
             else:
+                # 非阻塞播放，识别与播报并行；保护窗口覆盖播放及其后的 playbackGuardMs，防止回采触发唤醒。
+                sd.play(*heard)
+                speaker.guard_until = max(speaker.guard_until, time.monotonic() + len(heard[0]) / heard[1] + speaker.guard)
                 emit("state", state="transcribing")
                 t0 = time.monotonic()
                 s = asr.create_stream()
@@ -333,6 +339,7 @@ def main():
                     emit("transcript", text=text, audioMs=int(len(value) / SAMPLE_RATE * 1000), asrMs=asr_ms)
                 else:
                     emit("utterance_rejected", reason="empty")
+                sd.wait()  # 等“收到”播完，避免录音期间暂存的回复一放行就把它截断
             back_to_armed()
 
 
