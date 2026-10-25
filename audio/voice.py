@@ -89,6 +89,19 @@ WAKE_ACK_TEXT = "我在"
 HEARD_ACK_TEXT = "收到"  # 一句话录完立即播报，不等主 agent
 # 应答用固定语速，不随 ttsSpeed：实测 sid 12 在 1.95 倍时“我在”“收到”约九成输出 NaN，1.3–1.7 倍未出现。
 ACK_SPEED = 1.3
+# 转写只删“呃”“嗯”：其他语气词（啊、吧、那个…）带语义；“额”会误伤额度、额外。
+ONLY_HM = re.compile(r"[嗯\s，。！？,.!?]+")  # 整句只有“嗯”可能是在答“是”，原样保留
+FILLER = re.compile(r"呃+(?!逆)|嗯+")
+LEAD_PUNCT = re.compile(r"^[，、,。\s]+|(?<=[，、,])[，、,]+")  # 删词后留下的句首或重复逗号
+# 口吃式相邻完全重复（禁止禁止、补一下补一下）折叠为一次，只处理两字及以上的汉字片段。
+# 不处理：单字重复（看看、补补也可能是正常叠字）、以“一”开头或结尾的片段（一个一个）、叠字开头的片段（谢谢谢谢）、英文（had had）。
+REPEAT = re.compile(r"(?!一|([\u4e00-\u9fff])\1)([\u4e00-\u9fff]{2,})(?<!一)\2+")
+
+
+def strip_fillers(text):
+    if ONLY_HM.fullmatch(text):
+        return text
+    return re.sub(r"\s{2,}", " ", LEAD_PUNCT.sub("", REPEAT.sub(r"\2", FILLER.sub("", text)))).strip()
 
 
 def synthesize(tts, text, sid, speed):
@@ -370,7 +383,7 @@ def main():
                 # 实测 SenseVoice 在没有前导静音时会吞掉第一个音节，补 0.3 秒静音。
                 s.accept_waveform(SAMPLE_RATE, np.concatenate([np.zeros(int(0.3 * SAMPLE_RATE), dtype=np.float32), value]))
                 asr.decode_stream(s)
-                text = s.result.text.strip()
+                text = strip_fillers(s.result.text.strip())
                 asr_ms = int((time.monotonic() - t0) * 1000)
                 if text:
                     emit("transcript", text=text, audioMs=int(len(value) / SAMPLE_RATE * 1000), asrMs=asr_ms)
