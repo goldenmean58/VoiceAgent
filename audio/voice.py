@@ -82,7 +82,9 @@ def load_models(cfg):
     return kws, echo_kws, asr, tts, vad_cfg, t
 
 
-SENTENCE_END = re.compile(r"(?<=[。！？!?；;\n])")
+# 句末和中文逗号、顿号、冒号处都切开分别合成：sherpa-onnx 内部按长度而非标点分批，混有英文时停顿会落错位置。
+# 不在英文逗号、冒号处切，避免拆开 1,000、10:30。
+SEGMENT_END = re.compile(r"(?<=[。！？!?；;\n，、：])")
 WAKE_ACK_TEXT = "我在"
 HEARD_ACK_TEXT = "收到"  # 一句话录完立即播报，不等主 agent
 # 应答用固定语速，不随 ttsSpeed：实测 sid 12 在 1.95 倍时“我在”“收到”约九成输出 NaN，1.3–1.7 倍未出现。
@@ -123,7 +125,7 @@ def contains_wake(kws, samples, rate):
 
 
 class Speaker:
-    """单次只播一条；按句流水线合成，播放当前句时合成下一句。
+    """单次只播一条；按句和逗号分段流水线合成，播放当前段时合成下一段。
 
     播报期间照常检测唤醒词以便打断；合成后用 echo_kws 扫描每段音频，自身含唤醒词的段在播放期间及其后
     保护窗口内暂停检测，避免外放的口播把自己唤醒。
@@ -162,11 +164,7 @@ class Speaker:
             emit("speech", speechId=speech_id, state="interrupted")
 
     def play(self, speech_id, text):
-        sentences = [s.strip() for s in SENTENCE_END.split(text) if s.strip()] or [text]
-        # 首句较长时先在第一个逗号处切开，缩短开口前的合成等待。
-        first, sep, rest = sentences[0].partition("，")
-        if sep and rest and len(sentences[0]) > 16 and len(first) >= 4:
-            sentences[0:1] = [first + sep, rest]
+        sentences = [s.strip() for s in SEGMENT_END.split(text) if s.strip()] or [text]
         produced = queue.Queue(maxsize=2)
 
         def produce():
