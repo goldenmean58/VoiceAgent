@@ -514,7 +514,10 @@ function enqueueUpdate(task, detail) {
   notify("task", `${task.title}：${detail}`, { taskId: task.taskId, state: task.state });
 }
 
-const WORKER_ASK_NOTE = "（语音助手约定：不要使用 AskUserQuestion 工具。需要用户决定时，在回复末尾用文本写出问题和编号选项，然后结束本轮。）";
+const WORKER_ASK_NOTE = {
+  claude: "（语音助手约定：不要使用 AskUserQuestion 工具。需要用户决定时，在回复末尾用文本写出问题和编号选项，然后结束本轮。）",
+  codex: "（语音助手约定：不要使用 request_user_input 等交互式提问工具。需要提问或让用户选择时，在回复末尾用纯文本写出问题和编号选项，然后结束本轮。）",
+};
 
 async function sendToWorker(task, agent, text) {
   const sub = {
@@ -522,8 +525,8 @@ async function sendToWorker(task, agent, text) {
     status: "prepared", createdAt: now(), turnKey: null, stop: null, bgTaskIds: [],
   };
   sub.text = `[voice-assistant submission=${sub.id}]\n${text}`;
-  // AskUserQuestion 的选项只在 pane 里，Stop Hook 的最终消息拿不到，主 agent 无法转述。
-  if (agent.kind === "claude") sub.text += `\n\n${WORKER_ASK_NOTE}`;
+  // 交互式提问（AskUserQuestion、request_user_input）的选项只在 pane 里，Stop Hook 的最终消息拿不到，主 agent 无法转述。
+  sub.text += `\n\n${WORKER_ASK_NOTE[agent.kind]}`;
   S.subs[sub.id] = sub;
   agent.activeSubmissionId = sub.id;
   task.activeSubmissionId = sub.id;
