@@ -171,6 +171,7 @@ type TaskRecord = {
   taskId: string;
   conversationId: string;
   originMessageId: string;
+  dispatchId: string; // 建任务的主 agent dispatch
   workerAgentId: string;
   title: string;
   state: TaskState;
@@ -358,7 +359,7 @@ Herdr 的 Claude/Codex 集成可报告原生会话引用，但不能据此假设
 
 所有有副作用的请求带 `dispatchId` 和 `operationId`。daemon 只接受“当前在途的主 agent dispatch”的 dispatchId：该 dispatch 已投递、尚未结束，且主 agent 当前处于活动状态。其他请求一律以 `not_active_dispatch` 拒绝。dispatchId 只写在主会话输入中，不写进投递给工作 agent 的文本，避免工作 agent 调用工具替自己作出判断。
 
-worker、主 agent 与 daemon 以同一系统用户运行，同一用户的进程可以读取状态目录和 socket。因此这一校验只能防止误调用和顺手调用，不构成对抗性隔离。第一版把这一点作为已知限制写明。同一幂等键参数不同返回冲突；revision 不匹配返回最新状态，不替调用者猜测意图。`tasks.submit` 也校验 originMessageId，避免同一用户请求被重复建任务。
+worker、主 agent 与 daemon 以同一系统用户运行，同一用户的进程可以读取状态目录和 socket。因此这一校验只能防止误调用和顺手调用，不构成对抗性隔离。第一版把这一点作为已知限制写明。同一幂等键参数不同返回冲突；revision 不匹配返回最新状态，不替调用者猜测意图。`tasks.submit` 也校验 originMessageId：同一轮 dispatch 内，一条用户消息可以建多个任务，分别派给不同的工作 agent（每个工作 agent 同时最多一个未结束任务）；同一条消息被重新投递后的新一轮不能再建，避免重复建任务。
 
 结果事件携带元数据和 resultRef，主 agent 通过 tasks.get 读取完整原文。长结果按显式 offset/limit 分段，返回 totalChars、nextOffset 和是否读完；不会把截断内容伪装为完整结果，也不将整份长文本无界塞入主会话。任务判断必须读取支撑该结论的原文与限制。
 

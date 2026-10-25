@@ -20,7 +20,7 @@
 
 - **daemon**（`src/main.mjs`）：唯一的状态写入者。状态保存在只追加的 journal 中，重启后可以恢复；通过 Herdr 事件订阅和原生 Hook 判断回合的开始和结束。
 - **主 agent**：负责理解你的话、派发任务、审核工作结果、总结口播，通过 `voice-assistant tool <action>` 调用 daemon。
-- **工作 agent**：可同时管理多个（上限由 `worker.maxManaged` 决定），各自在你允许的项目目录里干活，每个同时最多一个未结束任务。也可以接管 Herdr 里已经在运行的 Claude/Codex 会话。
+- **工作 agent**：可同时管理多个（上限由 `worker.maxManaged` 决定），各自在你允许的项目目录里干活，每个同时最多一个未结束任务；一句话里的多个并行事项可以分别派给不同的工作 agent。也可以接管 Herdr 里已经在运行的 Claude/Codex 会话。
 - **音频进程**（`audio/voice.py`）：负责唤醒词、VAD、语音识别和语音合成，在有麦克风权限的终端里启动。
 
 ## 环境要求

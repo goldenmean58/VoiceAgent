@@ -1334,16 +1334,17 @@ const TOOLS = {
     return { agent: agentView(await resumeAgent(agentId)) };
   },
 
-  async "tasks.submit"({ agentId, originMessageId, title, text }) {
+  async "tasks.submit"({ agentId, originMessageId, title, text }, dispatchId) {
     const origin = S.inbox[originMessageId];
     if (!origin || origin.type !== "user.message") throw new ToolError("bad_input", "originMessageId 必须是本轮用户消息的 message id");
-    const dup = Object.values(S.tasks).find((t) => t.originMessageId === originMessageId);
-    if (dup) throw new ToolError("duplicate_origin", "该用户消息已经建过任务", { task: taskView(dup) });
+    // 同一轮可为一条消息建多个任务；消息被重新投递（resubmit）后的新一轮不能再建。
+    const dup = Object.values(S.tasks).find((t) => t.originMessageId === originMessageId && t.dispatchId !== dispatchId);
+    if (dup) throw new ToolError("duplicate_origin", "该用户消息已在之前的一轮建过任务", { task: taskView(dup) });
     const agent = await needReadyWorker(agentId);
     const unfinished = Object.values(S.tasks).find((t) => t.workerAgentId === agentId && !TERMINAL_STATES.has(t.state));
     if (unfinished) throw new ToolError("task_unfinished", `工作 agent 已有未结束的任务 ${unfinished.taskId}`, { task: taskView(unfinished) });
     const task = {
-      taskId: randomUUID(), conversationId: "default", originMessageId, workerAgentId: agentId,
+      taskId: randomUUID(), conversationId: "default", originMessageId, dispatchId, workerAgentId: agentId,
       title: needText(title, "title"), state: "dispatching", revision: 0, activeSubmissionId: null,
       pendingRequestId: null, latestResultEventId: null, autoContinueCount: 0, uncertainReason: null,
       pendingInputs: [], createdAt: now(),
