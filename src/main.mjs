@@ -380,15 +380,18 @@ async function launchAgent(role, kind, cwd, displayName) {
   S.agents[agentId] = agent;
   saveAgent(agent);
   commit();
-  const main = mainAgent();
+  // 主 agent 独占一个 tab，不被工作 agent 的分屏压矮：pane 不足 12 行时 Claude Code 会把多行输入当成粘贴包起来。
+  // 工作 agent 留在 daemon 所在的 tab：第一个在 daemon 右侧，之后接在最近启动的工作 agent 下方。
+  const lastWorker = managedWorkers().filter((a) => !a.adopted && a.backendRef).at(-1);
   const r = await herdr.start({
     name: `va-${role}-${agentId.slice(0, 6)}`,
     kind,
     cwd,
     env,
     args: launchArgs(role, kind, agentId, nativeSessionId),
-    fromRef: role === "worker" ? main.backendRef : null,
-    direction: role === "main" ? "right" : "down",
+    newTab: role === "main",
+    fromRef: lastWorker?.backendRef ?? null,
+    direction: lastWorker ? "down" : "right",
   });
   agent.backendRef = r.backendRef ?? null;
   if (!r.ok) {

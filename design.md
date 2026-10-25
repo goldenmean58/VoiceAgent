@@ -92,7 +92,7 @@ flowchart TD
 
 ### 3.2 主 agent 的启动
 
-在用户启动助手的 Herdr tab 和 cwd 下创建一个主 agent pane，启动所选原生 CLI。主 agent 的角色说明通过已核验的原生启动配置加载；不修改项目原有 `AGENTS.md` 或 `CLAUDE.md`。
+在用户启动助手的 Herdr workspace 里新建一个 tab，主 agent 独占这个 tab，cwd 与 daemon 相同，启动所选原生 CLI。独占是为了保持 pane 高度：Claude Code 在终端不足 12 行时，会把含换行的粘贴输入（herdr `agent prompt` 按 bracketed paste 写入）折叠并包成 `<pasted_content>`，主 agent 会把 dispatch 当成不可信的粘贴内容。主 agent 的角色说明通过已核验的原生启动配置加载；不修改项目原有 `AGENTS.md` 或 `CLAUDE.md`。
 
 第一版中，本助手启动的主 agent 和工作 agent 一律以最大权限运行，避免任何审批弹窗卡住语音闭环：
 
@@ -108,7 +108,7 @@ flowchart TD
 
 启动步骤（已在本机实测，见第 17 节）：
 
-1. 用 `herdr pane split --cwd <项目目录> --env VA_AGENT_ID=<agentId> --no-focus` 创建 pane。Claude 会话还要注入 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`。两个 CLI 的 Hook 进程都继承这些环境变量，所以 Hook 事件从第一条起就能按 agentId 归属，不需要按 cwd 或“最近新开的 pane”猜测。
+1. 用 `herdr tab create --workspace <id> --cwd <项目目录> --env VA_AGENT_ID=<agentId> --no-focus` 创建 tab，在它的 root pane 中启动；工作 agent 用 `herdr pane split` 创建 pane，参数相同。Claude 会话还要注入 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`。两个 CLI 的 Hook 进程都继承这些环境变量，所以 Hook 事件从第一条起就能按 agentId 归属，不需要按 cwd 或“最近新开的 pane”猜测。
 2. 用 `herdr agent start <name> --kind <kind> --pane <id> -- <权限参数> <角色说明参数>` 启动 CLI。实现中确认的细节：
    - 新 pane 的 shell 初始化完成前，Herdr 返回 `agent_pane_busy` 且不发送输入，需等它进入提示符再启动。
    - Herdr 拒绝含换行的 agent 参数（`invalid_agent_argument`）。Claude 的角色说明用 `--append-system-prompt-file` 传入；Codex 用 `-c developer_instructions=<转义后的单行字符串>`。
@@ -123,7 +123,7 @@ flowchart TD
 
 关闭后台任务的代价：Bash 命令超时后不会转入后台，而是直接结束；默认超时为 2 分钟，模型最多可设到 10 分钟。需要更长运行时间的项目，通过 `BASH_DEFAULT_TIMEOUT_MS` 或 `BASH_MAX_TIMEOUT_MS` 调整。MCP tasks 和 Monitor 工具不受这个变量控制，仍可能在后台运行，残留情况按第 9.3 节第 6 条处理。[Claude Code 环境变量](https://code.claude.com/docs/en/env-vars)
 
-工作 agent 按需创建为同 tab 的另一个 pane，继承明确的项目目录，创建时保留用户焦点。不自动创建 workspace、tab 或 worktree。
+工作 agent 按需创建为 daemon 所在 tab 的另一个 pane，不进入主 agent 的 tab：第一个在 daemon 右侧，之后接在最近启动的工作 agent 下方。继承明确的项目目录，创建时保留用户焦点。除主 agent 的 tab 外，不自动创建 workspace、tab 或 worktree。
 
 ## 4. 数据模型与不变量
 

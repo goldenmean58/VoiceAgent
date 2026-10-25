@@ -44,8 +44,8 @@ function observe(pane, kind) {
 }
 
 export function assertAvailable() {
-  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID || !process.env.HERDR_SOCKET_PATH) {
-    throw new Error("必须在 Herdr 管理的 pane 中运行（HERDR_ENV=1，且有 HERDR_PANE_ID 和 HERDR_SOCKET_PATH）");
+  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID || !process.env.HERDR_WORKSPACE_ID || !process.env.HERDR_SOCKET_PATH) {
+    throw new Error("必须在 Herdr 管理的 pane 中运行（HERDR_ENV=1，且有 HERDR_PANE_ID、HERDR_WORKSPACE_ID 和 HERDR_SOCKET_PATH）");
   }
 }
 
@@ -99,15 +99,16 @@ export async function discover() {
   }));
 }
 
-// 在 fromRef（或当前 pane）旁新建 pane 并启动 agent。成功返回 backendRef；
+// 在当前 workspace 的新 tab（newTab）或 fromRef（或当前 pane）旁新建 pane 并启动 agent。成功返回 backendRef；
 // 启动后停在原生交互界面（信任确认、Hook 审核）时返回 ok:false 并说明原因，pane 保留供用户查看。
-export async function start({ name, kind, cwd, env, args, fromRef, direction }) {
-  const from = fromRef ? JSON.parse(fromRef).paneId : process.env.HERDR_PANE_ID;
-  const splitArgs = ["pane", "split", from, "--direction", direction, "--cwd", cwd, "--no-focus"];
-  for (const [k, v] of Object.entries(env)) splitArgs.push("--env", `${k}=${v}`);
-  const split = await run(splitArgs);
-  if (!split.ok) return { ok: false, reason: `创建 pane 失败：${split.message}` };
-  const pane = split.result.pane;
+export async function start({ name, kind, cwd, env, args, newTab, fromRef, direction }) {
+  const createArgs = newTab
+    ? ["tab", "create", "--workspace", process.env.HERDR_WORKSPACE_ID, "--cwd", cwd, "--label", name, "--no-focus"]
+    : ["pane", "split", fromRef ? JSON.parse(fromRef).paneId : process.env.HERDR_PANE_ID, "--direction", direction, "--cwd", cwd, "--no-focus"];
+  for (const [k, v] of Object.entries(env)) createArgs.push("--env", `${k}=${v}`);
+  const created = await run(createArgs);
+  if (!created.ok) return { ok: false, reason: `创建 ${newTab ? "tab" : "pane"} 失败：${created.message}` };
+  const pane = newTab ? created.result.root_pane : created.result.pane;
   const backendRef = JSON.stringify({ paneId: pane.pane_id, terminalId: pane.terminal_id });
 
   // 新 pane 的 shell 初始化完成前，Herdr 返回 agent_pane_busy 且不发送任何输入；等它进入提示符。
