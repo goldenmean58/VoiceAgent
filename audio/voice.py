@@ -10,6 +10,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 
 import numpy as np
 import sherpa_onnx
@@ -344,4 +345,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 退出时用 os._exit 跳过解释器收尾：sounddevice 的 atexit 会关闭 PortAudio 流，若此时 Speaker 线程正在
+    # sd.play/sd.stop 中关流，两者在 CoreAudio 里互相等待，进程永远卡住，父进程退出后成为孤儿。
+    try:
+        main()
+        code = 0
+    except SystemExit as e:  # fail()
+        code = e.code
+    except KeyboardInterrupt:
+        code = 130
+    except BaseException:
+        traceback.print_exc()
+        code = 1
+    os._exit(code)
