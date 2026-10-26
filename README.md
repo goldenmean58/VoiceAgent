@@ -61,6 +61,7 @@
 | --- | --- |
 | `main.kind` / `worker.defaultKind` | `claude` 或 `codex` |
 | `main.model` / `main.effort` | 可省略，省略时沿用 CLI 默认值。Claude 的 effort 可选 `low`/`medium`/`high`/`xhigh`/`max`；Codex 可选 `minimal`/`low`/`medium`/`high`/`xhigh` |
+| `main.command` / `worker.commands` | 可省略，省略时用 `claude` / `codex`。填命令名或已存在的绝对路径，可以是包装脚本，例如 `"main": { "kind": "claude", "command": "/usr/local/bin/doubao" }`、`"worker": { "commands": { "claude": "/usr/local/bin/doubao" } }`（按 kind 分别配置）。包装脚本必须最终 `exec` 对应的 CLI 并原样透传参数（`"$@"`），Herdr 按进程识别 agent；脚本自带的 `--settings` 会保留 |
 | `worker.maxManaged` | 同时受管的工作 agent 上限（正整数）；达到上限后启动或接管会返回 `worker_limit` |
 | `worker.maxAutoContinue` | 主 agent 连续让工作 agent"继续"的次数上限，用完后只能问你或给出结论 |
 | `projects.allowedRoots` | 工作 agent 只能在这些目录（含子目录）中启动或被接管 |

@@ -92,7 +92,17 @@ function loadConfig() {
     const levels = c.main.kind === "claude" ? ["low", "medium", "high", "xhigh", "max"] : ["minimal", "low", "medium", "high", "xhigh"];
     if (!levels.includes(c.main.effort)) errs.push(`main.effort 必须为 ${levels.join("/")} 之一`);
   }
+  // 执行命令可省略：省略时用与 kind 同名的命令。可以是包装脚本（如 /usr/local/bin/doubao），但最终须启动该 kind 的 CLI。
+  const badCommand = (v) => typeof v !== "string" || !(path.isAbsolute(v) ? existsSync(v) : /^[\w.-]+$/.test(v));
+  if (c.main?.command !== undefined && badCommand(c.main.command)) errs.push(`main.command 必须为命令名或已存在的绝对路径：${c.main.command}`);
   if (!KINDS.includes(c.worker?.defaultKind)) errs.push("worker.defaultKind 必须为 claude 或 codex");
+  if (c.worker?.commands !== undefined) {
+    if (typeof c.worker.commands !== "object" || !c.worker.commands || Array.isArray(c.worker.commands)) errs.push("worker.commands 必须为对象");
+    else for (const [k, v] of Object.entries(c.worker.commands)) {
+      if (!KINDS.includes(k)) errs.push(`worker.commands 的键必须为 claude 或 codex：${k}`);
+      else if (badCommand(v)) errs.push(`worker.commands.${k} 必须为命令名或已存在的绝对路径：${v}`);
+    }
+  }
   if (!Number.isInteger(c.worker?.maxManaged) || c.worker.maxManaged < 1) errs.push("worker.maxManaged 必须为正整数");
   if (!Number.isInteger(c.worker?.maxAutoContinue) || c.worker.maxAutoContinue < 0) errs.push("worker.maxAutoContinue 必须为非负整数");
   const roots = [];
@@ -336,11 +346,15 @@ function renderMainPrompt() {
 
 function launchArgs(role, kind, agentId, nativeSessionId) {
   if (kind === "claude") {
-    const settings = { hooks: Object.fromEntries(HOOK_EVENTS.claude.map((e) => [e, [{ hooks: [{ type: "command", command: hookCommandLine("claude", e) }] }]])) };
-    const settingsFile = path.join(LAUNCH_DIR, `${agentId}-settings.json`);
-    writeFileAtomic(settingsFile, JSON.stringify(settings, null, 2));
-    const args = ["--dangerously-skip-permissions", "--session-id", nativeSessionId, "--settings", settingsFile];
-    // Herdr 拒绝含换行的启动参数，角色说明经文件传入。
+    // Hook 经仅本会话加载的插件目录注入，不用 --settings：多个 --settings 只有最后一个生效，会覆盖包装脚本自带的 --settings。
+    const hooks = { hooks: Object.fromEntries(HOOK_EVENTS.claude.map((e) => [e, [{ hooks: [{ type: "command", command: hookCommandLine("claude", e) }] }]])) };
+    const pluginDir = path.join(LAUNCH_DIR, `${agentId}-plugin`);
+    ensureDir(path.join(pluginDir, ".claude-plugin"));
+    ensureDir(path.join(pluginDir, "hooks"));
+    writeFileAtomic(path.join(pluginDir, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "voice-assistant" }));
+    writeFileAtomic(path.join(pluginDir, "hooks", "hooks.json"), JSON.stringify(hooks, null, 2));
+    const args = ["--dangerously-skip-permissions", "--session-id", nativeSessionId, "--plugin-dir", pluginDir];
+    // 启动命令行经 shell 提交，参数不能含换行，角色说明经文件传入。
     if (role === "main") {
       const promptFile = path.join(LAUNCH_DIR, `${agentId}-prompt.md`);
       writeFileAtomic(promptFile, renderMainPrompt());
@@ -388,6 +402,7 @@ async function launchAgent(role, kind, cwd, displayName) {
   const r = await herdr.start({
     name: `va-${role}-${agentId.slice(0, 6)}`,
     kind,
+    command: (role === "main" ? config.main.command : config.worker.commands?.[kind]) ?? kind,
     cwd,
     env,
     args: launchArgs(role, kind, agentId, nativeSessionId),

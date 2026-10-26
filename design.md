@@ -109,14 +109,14 @@ flowchart TD
 启动步骤（已在本机实测，见第 17 节）：
 
 1. 用 `herdr tab create --workspace <id> --cwd <项目目录> --env VA_AGENT_ID=<agentId> --no-focus` 创建 tab，在它的 root pane 中启动；工作 agent 用 `herdr pane split` 创建 pane，参数相同。Claude 会话还要注入 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`。两个 CLI 的 Hook 进程都继承这些环境变量，所以 Hook 事件从第一条起就能按 agentId 归属，不需要按 cwd 或“最近新开的 pane”猜测。
-2. 用 `herdr agent start <name> --kind <kind> --pane <id> -- <权限参数> <角色说明参数>` 启动 CLI。实现中确认的细节：
-   - 新 pane 的 shell 初始化完成前，Herdr 返回 `agent_pane_busy` 且不发送输入，需等它进入提示符再启动。
-   - Herdr 拒绝含换行的 agent 参数（`invalid_agent_argument`）。Claude 的角色说明用 `--append-system-prompt-file` 传入；Codex 用 `-c developer_instructions=<转义后的单行字符串>`。
-   - Hook 随启动注入：Claude 用 `--settings <文件>`，Codex 用 `-c hooks.<事件>=[...]`。这样不改用户的全局 Hook 配置，只有本助手启动的会话会触发。Codex 的信任按命令哈希记录，命令路径不变，信任就一直有效。
+2. 用 `herdr pane run <id> '<命令> <权限参数> <角色说明参数>'` 启动 CLI，等 Herdr 在该 pane 识别出同类 agent 并报告 idle 或 done，再用 `herdr agent rename` 命名。命令默认与 kind 同名，可用 `main.command` / `worker.commands` 换成包装脚本（第 12.2 节）。`herdr agent start` 只能运行 kind 的内置可执行文件，所以不用它。实现中确认的细节：
+   - 新 pane 的 shell 进入提示符前，终端处于 canonical 模式：超过 1024 字节的命令行（如 Codex 主 agent 带角色说明的命令行，约 7KB）被拒为 `pane_send_failed`，且不发送输入，需等它进入提示符再运行；较短的命令行作为预输入排队，shell 就绪后执行。
+   - 命令行按 POSIX shell 单引号转义后提交，参数不能含换行。Claude 的角色说明用 `--append-system-prompt-file` 传入；Codex 用 `-c developer_instructions=<转义后的单行字符串>`。
+   - Hook 随启动注入：Claude 用 `--plugin-dir <目录>` 加载一个只含 Hook 的临时插件，Codex 用 `-c hooks.<事件>=[...]`。这样不改用户的全局 Hook 配置，只有本助手启动的会话会触发。Claude 不用 `--settings` 注入：实测多个 `--settings` 只有最后一个生效，会覆盖包装脚本自带的 `--settings`（如 doubao 的 provider 配置）。Codex 的信任按命令哈希记录，命令路径不变，信任就一直有效。
    - Claude 用 `--session-id <uuid>` 预先指定原生会话 ID。
 3. 启动前做两项预检，任一项不满足就报告原因，不启动：
-   - Claude：目标目录已被信任。未信任时，即使带 `--dangerously-skip-permissions` 也会先弹出目录信任确认，Herdr 报 blocked 和 `agent_not_ready`。
-   - Codex：本应用的 Hook 已经信任，即 `config.toml` 的 `hooks.state` 里有与当前 Hook 哈希一致的记录。未信任时，Codex 启动后先显示 Hook 审核界面，而 Herdr 把这个状态报成 idle，`agent start` 照样返回成功；此时投递的输入会落进审核界面。
+   - Claude：目标目录已被信任。未信任时，即使带 `--dangerously-skip-permissions` 也会先弹出目录信任确认，Herdr 报 blocked。
+   - Codex：本应用的 Hook 已经信任，即 `config.toml` 的 `hooks.state` 里有与当前 Hook 哈希一致的记录。未信任时，Codex 启动后先显示 Hook 审核界面，而 Herdr 把这个状态报成 idle，看起来已经就绪；此时投递的输入会落进审核界面。
 4. 就绪判定：
    - Claude：收到带匹配 `VA_AGENT_ID` 的 SessionStart 后绑定 nativeSessionId，宣布就绪。
    - Codex：只在第一次提交输入时触发 SessionStart，Herdr 也在那时才报告会话 ID。因此 Herdr 报告就绪且预检通过即可视为就绪；nativeSessionId 在第一轮的 UserPromptSubmit 中绑定，绑定之前的身份核对见第 4.3 节第 3 条。
@@ -306,7 +306,7 @@ Herdr 的 `agent prompt` 也接受 working 状态的 agent，成功响应只表�
 | 应用操作 | Herdr 实现职责 |
 | --- | --- |
 | `discover` | 发现当前服务器中的 agent，整理 native session 和状态 |
-| `start` | 分配可用 shell pane，再启动指定 kind；处理布局与焦点 |
+| `start` | 分配可用 shell pane，在其中运行配置的命令，等识别出指定 kind 并就绪；处理布局与焦点 |
 | `inspect` | 查询绑定对象，确认仍为原来的 CLI/native session |
 | `submit` | 通过 agent 输入接口定向提交文本；不使用 shell 命令模拟 prompt |
 | `cancel` | 按已核验的 CLI 行为中断当前回合，并随后观察是否真正停止 |
@@ -756,6 +756,8 @@ daemon 对外提供本用户可访问的 Unix socket，运行目录权限 0700�
 }
 ```
 
+`main.command` 与 `worker.commands`（按 kind 分别配置，如 `{ "claude": "/usr/local/bin/doubao" }`）可省略，省略时用与 kind 同名的命令。值为命令名或已存在的绝对路径，可以是包装脚本：脚本必须最终 `exec` 对应的 CLI 并原样透传参数，Herdr 按进程识别 agent，识别不到就按启动失败处理。主 agent 和工作 agent 可以分别配置，例如主 agent 用 doubao、工作 agent 用原版 Claude。
+
 `main.model` 与 `main.effort` 可省略，省略时沿用原生 CLI 的默认值。Claude 主 agent 传 `--model` / `--effort`（low/medium/high/xhigh/max）；Codex 主 agent 传 `-m` 和 `-c model_reasoning_effort=…`（minimal/low/medium/high/xhigh）。主 agent 只负责理解、派发、审核和总结，推荐 Sonnet + medium。测试数据显示主 agent 的消耗几乎全在每次调用重读上下文：两个主会话 97 次调用共读约 630 万 token，输出含思考约 2.2 万 token。因此思考强度主要影响延迟，不是成本。
 
 Claude 主 agent 额外传 `--tools Bash --strict-mcp-config`：主 agent 只用 Bash 调用工具命令，不需要其他内置工具和用户配置的 MCP 工具。用 `claude -p` 实测只回复一句话时的上下文：默认 31,606 token；只留 Bash 时 20,574 token（剩余的主要是 MCP 工具定义）；再加 `--strict-mcp-config` 后 7,427 token。
@@ -991,6 +993,14 @@ macOS 麦克风权限的实测结论：
   
   接管后的会话完成了一个改文件的任务，结果经主助手审阅后汇报。
 - V07 未完成：本机 Claude 默认处于跳过权限模式，接管的会话不会出现权限弹窗。需要用 `--permission-mode default` 启动的会话再测。
+
+可配置执行命令（2026-10-26 实测，Herdr 0.9.5、Claude Code 2.1.310、codex-cli 0.164.0）：
+
+- Claude 的 `--settings` 传多次时只有最后一个生效；`--plugin-dir` 加载的插件 Hook 与 `--settings` 互不覆盖。
+- 用 `herdr.start` 直接测试：以 `/usr/local/bin/doubao`（`exec claude --settings <provider 配置> "$@"` 的包装脚本）带主 agent 参数启动，Herdr 识别为 claude 并报告与 `--session-id` 一致的会话 ID。插件 Hook 的 SessionStart、UserPromptSubmit、Stop 都继承 `VA_AGENT`，prompt_id 一致，Stop 中有 last_assistant_message。transcript 里的模型是 doubao 映射的模型，说明包装脚本的 provider 配置保留。默认命令 `claude` 带工作 agent 参数同样通过。
+- Codex 主 agent 的命令行约 7.3KB，shell 就绪前被拒为 `pane_send_failed`，重试后启动成功，没有 Hook 审核界面。
+- 目录未信任时报告需先信任目录；命令没有启动对应 CLI 时（如 `/usr/bin/true`），60 秒后报告未识别到 agent。
+- 尚未在 daemon 中端到端运行。
 
 开始实现时仍需核验：
 

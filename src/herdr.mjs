@@ -99,9 +99,16 @@ export async function discover() {
   }));
 }
 
-// 在当前 workspace 的新 tab（newTab）或 fromRef（或当前 pane）旁新建 pane 并启动 agent。成功返回 backendRef；
+// POSIX shell 单引号转义，供 pane run 拼命令行。
+function shellQuote(s) {
+  return /^[\w+:,./-]+$/.test(s) ? s : `'${s.replaceAll("'", `'\\''`)}'`;
+}
+
+// 在当前 workspace 的新 tab（newTab）或 fromRef（或当前 pane）旁新建 pane，用 command 启动 kind 类 agent。成功返回 backendRef；
 // 启动后停在原生交互界面（信任确认、Hook 审核）时返回 ok:false 并说明原因，pane 保留供用户查看。
-export async function start({ name, kind, cwd, env, args, newTab, fromRef, direction }) {
+// herdr agent start 只能运行 kind 的内置可执行文件，因此改为在 shell 中运行命令行，再等 Herdr 识别出同类 agent 并就绪。
+// command 可以是包装脚本（如 doubao），但最终必须启动该 kind 的 CLI，否则 Herdr 识别不到。
+export async function start({ name, kind, command, cwd, env, args, newTab, fromRef, direction }) {
   const createArgs = newTab
     ? ["tab", "create", "--workspace", process.env.HERDR_WORKSPACE_ID, "--cwd", cwd, "--label", name, "--no-focus"]
     : ["pane", "split", fromRef ? JSON.parse(fromRef).paneId : process.env.HERDR_PANE_ID, "--direction", direction, "--cwd", cwd, "--no-focus"];
@@ -111,20 +118,37 @@ export async function start({ name, kind, cwd, env, args, newTab, fromRef, direc
   const pane = newTab ? created.result.root_pane : created.result.pane;
   const backendRef = JSON.stringify({ paneId: pane.pane_id, terminalId: pane.terminal_id });
 
-  // 新 pane 的 shell 初始化完成前，Herdr 返回 agent_pane_busy 且不发送任何输入；等它进入提示符。
-  let started;
+  // 新 pane 的 shell 进入提示符前终端处于 canonical 模式，超过 1024 字节的命令行会被拒（pane_send_failed）且不发送任何输入；
+  // 等它进入提示符。较短的命令行会作为预输入排队，shell 就绪后执行。
+  const line = [command, ...args].map(shellQuote).join(" ");
+  let ran;
   for (const deadline = Date.now() + 20000; ;) {
-    started = await run(["agent", "start", name, "--kind", kind, "--pane", pane.pane_id, "--timeout", "60000", "--", ...args], { timeoutMs: 70000 });
-    if (started.ok || started.code !== "agent_pane_busy" || Date.now() > deadline) break;
+    ran = await run(["pane", "run", pane.pane_id, line], { json: false });
+    if (ran.ok || ran.code !== "pane_send_failed" || Date.now() > deadline) break;
     await new Promise((r) => setTimeout(r, 500));
   }
-  if (!started.ok) {
+  if (!ran.ok) return { ok: false, backendRef, reason: `在 pane ${pane.pane_id} 中运行 ${command} 失败（${ran.code}）：${ran.message}` };
+
+  // 与 herdr agent start 相同的就绪判定：识别出同类 agent 且 idle/done；启动阶段 blocked 立即按未就绪处理。
+  let status = null;
+  for (const deadline = Date.now() + 60000; !["idle", "done", "blocked"].includes(status) && Date.now() < deadline;) {
+    await new Promise((r) => setTimeout(r, 500));
+    const got = await run(["pane", "get", pane.pane_id]);
+    if (!got.ok) return { ok: false, backendRef, reason: `查询 pane ${pane.pane_id} 失败：${got.message}` };
+    status = got.result.pane.agent === kind ? got.result.pane.agent_status : null;
+  }
+  if (status !== "idle" && status !== "done") {
     const screen = await readScreen(backendRef);
     if (/trust this folder/i.test(screen)) {
       return { ok: false, backendRef, reason: `${kind} 要求先信任目录 ${cwd}；请在 pane ${pane.pane_id} 中确认后重试` };
     }
-    return { ok: false, backendRef, reason: `启动 ${kind} 失败（${started.code}）：${started.message}` };
+    return {
+      ok: false, backendRef,
+      reason: status === "blocked" ? `${command} 启动后停在待确认界面；请在 pane ${pane.pane_id} 中查看` : `${command} 运行后 60s 内 Herdr 没有识别到就绪的 ${kind}；请在 pane ${pane.pane_id} 中查看`,
+    };
   }
+  const renamed = await run(["agent", "rename", pane.pane_id, name]);
+  if (!renamed.ok) return { ok: false, backendRef, reason: `命名 agent 失败：${renamed.message}` };
   // Herdr 把 Codex 的 Hook 审核界面报告为 idle，只能在启动诊断时读屏识别。
   if (kind === "codex" && /Hooks need review/i.test(await readScreen(backendRef))) {
     return { ok: false, backendRef, reason: `Codex 的 Hook 尚未信任；请在 pane ${pane.pane_id} 中用 /hooks 信任后重试` };
